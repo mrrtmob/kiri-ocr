@@ -146,13 +146,18 @@ def main():
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
     # === PREDICT / RUN ===
+    # Resolve default paths relative to package
+    base_path = Path(__file__).parent
+    default_model = base_path / 'models' / 'model.kiri'
+    default_charset = base_path / 'models' / 'charset_lite.txt'
+
     predict_parser = subparsers.add_parser('predict', help='Run OCR on an image')
     predict_parser.add_argument('image', help='Path to document image')
     predict_parser.add_argument('--mode', choices=['lines', 'words'], default='lines',
                        help='Detection mode (default: lines)')
-    predict_parser.add_argument('--model', default='models/model.kiri',
+    predict_parser.add_argument('--model', default=str(default_model),
                        help='Path to model file')
-    predict_parser.add_argument('--charset', default='models/charset_lite.txt',
+    predict_parser.add_argument('--charset', default=str(default_charset),
                        help='Path to charset file')
     predict_parser.add_argument('--language', choices=['english', 'khmer', 'mixed'], 
                        default='mixed', help='Language mode')

@@ -1,4 +1,3 @@
-recursive-include models *.kiri
-recursive-include models *.txt
-recursive-include models *.blizzer
-include models/model.kiri
+recursive-include kiri_ocr/models *.kiri
+recursive-include kiri_ocr/models *.txt
+recursive-include kiri_ocr/models *.blizzer
