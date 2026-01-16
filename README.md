@@ -183,7 +183,9 @@ kiri-ocr train \
 
 This loads the weights from `models/model.kiri` before starting training. Useful for domain adaptation or adding languages.
 
-The trained model will be saved to `models/model.kiri` (or specified `output_dir`).☕ Support
+The trained model will be saved to `models/model.kiri` (or specified `output_dir`).
+
+### ☕ Support
 
 If you find this project useful, you can support me here:
 
