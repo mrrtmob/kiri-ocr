@@ -18,7 +18,9 @@ DEFAULT_TRAIN_CONFIG = {
     "device": "cuda",
     "output_dir": "models",
     "train_labels": "data/train/labels.txt",
-    "val_labels": "data/val/labels.txt"
+    "val_labels": "data/val/labels.txt",
+    "lr": 0.001,
+    "weight_decay": 0.0001
 }
 
 def init_config(args):
@@ -182,6 +184,8 @@ def main():
     train_parser.add_argument('--hidden-size', type=int, help='Hidden size')
     train_parser.add_argument('--device', help='Device (cuda/cpu)')
     train_parser.add_argument('--from-model', help='Path to pretrained model for fine-tuning')
+    train_parser.add_argument('--lr', type=float, help='Learning rate')
+    train_parser.add_argument('--weight-decay', type=float, help='Weight decay')
     
     # === GENERATE ===
     gen_parser = subparsers.add_parser('generate', help='Generate synthetic data')

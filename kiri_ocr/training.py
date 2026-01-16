@@ -152,12 +152,14 @@ def train_model(
     num_epochs=200,
     device="cuda",
     save_dir="models",
+    lr=0.001,
+    weight_decay=0.0001,
 ):
     os.makedirs(save_dir, exist_ok=True)
 
     model = model.to(device)
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10
     )
@@ -501,4 +503,6 @@ def train_command(args):
         num_epochs=NUM_EPOCHS,
         device=device,
         save_dir=args.output_dir,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
