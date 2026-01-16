@@ -1,6 +1,6 @@
 # Kiri OCR 📄
 
-**Kiri OCR** is a lightweight, production-ready OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package (~13MB model).
+**Kiri OCR** is a lightweight, OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package (~13MB model).
 
 ![Kiri OCR](assets/image.png)
 
@@ -30,7 +30,7 @@ Results on synthetic test images (10 popular fonts):
 You can install the package directly from the source:
 
 ```bash
-https://github.com/mrrtmob/ocr.git
+https://github.com/mrrtmob/kiri-ocr.git
 cd kiri_ocr
 pip install .
 ```
