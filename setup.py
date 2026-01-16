@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="kiri_ocr",
-    version="0.1.0",
+    version="0.1.1",
     description="A lightweight OCR library for Khmer and English documents",
     author="Blizzer",
     packages=find_packages(),
