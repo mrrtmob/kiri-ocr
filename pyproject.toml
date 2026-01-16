@@ -7,19 +7,31 @@ name = "kiri_ocr"
 version = "0.1.1"
 description = "A lightweight OCR library for Khmer and English documents"
 authors = [
-    {name = "Blizzer Team"}
+    {name = "Blizzer"}
 ]
 dependencies = [
-    "torch",
-    "numpy",
-    "opencv-python",
-    "Pillow",
-    "tqdm",
-    "matplotlib",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.7.0",
+    "Pillow>=9.0.0",
+    "tqdm>=4.65.0",
+    "matplotlib>=3.7.0",
     "scipy",
-    "datasets",
-    "huggingface_hub"
+    "datasets>=2.14.0",
+    "huggingface_hub>=0.16.0",
+    "PyYAML"
 ]
 requires-python = ">=3.6"
 readme = "README.md"
-license = {text = "MIT"}
+license = "Apache-2.0"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+kiri-ocr = "kiri_ocr.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kiri_ocr*"]
