@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kiri_ocr"
+version = "0.1.0"
+description = "A lightweight OCR library for Khmer and English documents"
+authors = [
+    {name = "Blizzer Team"}
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "opencv-python",
+    "Pillow",
+    "tqdm",
+    "matplotlib",
+    "scipy",
+    "datasets",
+    "huggingface_hub"
+]
+requires-python = ">=3.6"
+readme = "README.md"
+license = {text = "MIT"}
