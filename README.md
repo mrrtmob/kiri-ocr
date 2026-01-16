@@ -1,8 +1,13 @@
 # Kiri OCR 📄
 
+[![PyPI version](https://badge.fury.io/py/kiri-ocr.svg)](https://badge.fury.io/py/kiri-ocr)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Python Versions](https://img.shields.io/pypi/pyversions/kiri-ocr.svg)](https://pypi.org/project/kiri-ocr/)
+[![Downloads](https://static.pepy.tech/badge/kiri-ocr)](https://pepy.tech/project/kiri-ocr)
+
 **Kiri OCR** is a lightweight, OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package (~13MB model).
 
-![Kiri OCR](assets/image.png)
+![Kiri OCR](https://raw.githubusercontent.com/mrrtmob/kiri-ocr/main/assets/image.png)
 
 ## ✨ Key Features
 
@@ -21,17 +26,23 @@ The model is trained on the [mrrtmob/km_en_image_line](https://huggingface.co/da
 
 Results on synthetic test images (10 popular fonts):
 
-![Benchmark Graph](benchmark/benchmark_graph.png)
+![Benchmark Graph](https://raw.githubusercontent.com/mrrtmob/kiri-ocr/main/benchmark/benchmark_graph.png)
 
-![Benchmark Table](benchmark/benchmark_table.png)
+![Benchmark Table](https://raw.githubusercontent.com/mrrtmob/kiri-ocr/main/benchmark/benchmark_table.png)
 
-## � Installation
+## 📦 Installation
 
-You can install the package directly from the source:
+Install easily via pip:
 
 ```bash
-https://github.com/mrrtmob/kiri-ocr.git
-cd kiri_ocr
+pip install kiri-ocr
+```
+
+Or install from source:
+
+```bash
+git clone https://github.com/mrrtmob/kiri-ocr.git
+cd kiri-ocr
 pip install .
 ```
 
@@ -194,4 +205,4 @@ If you find this project useful, you can support me here:
 
 ## ⚖️ License
 
-[Apache License 2.0](LICENSE).
+[Apache License 2.0](https://github.com/mrrtmob/kiri-ocr/blob/main/LICENSE).

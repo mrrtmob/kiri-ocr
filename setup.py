@@ -4,7 +4,7 @@ setup(
     name="kiri_ocr",
     version="0.1.0",
     description="A lightweight OCR library for Khmer and English documents",
-    author="Blizzer Team",
+    author="Blizzer",
     packages=find_packages(),
     install_requires=[
         "torch",
@@ -16,7 +16,7 @@ setup(
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
+        "License :: OSI Approved :: Apache-2.0",
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.6",
