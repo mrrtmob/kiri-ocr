@@ -63,17 +63,12 @@ kiri-ocr predict path/to/document.jpg --output results/
 ```python
 from kiri_ocr import OCR
 
-# Initialize Lite Model
+# Initialize (loads from Hugging Face automatically)
 ocr = OCR()
 
-# Process document
-results = ocr.process_document()
-
 # Extract text
-text, _ = ocr.extract_text('document.jpg')
+text, results = ocr.extract_text('document.jpg')
 print(text)
-
-
 ```
 
 ## 🎓 Training a New Model

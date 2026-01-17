@@ -12,7 +12,7 @@ from .detector import TextDetector
 class OCR:
     """Complete Document OCR System with Padding"""
     
-    def __init__(self, model_path='models/model.kiri',
+    def __init__(self, model_path='mrrtmob/kiri-ocr',
                  charset_path='models/charset_lite.txt',
                  language='mixed',
                  padding=10,
@@ -33,17 +33,36 @@ class OCR:
         self.padding = padding
         
         # Resolve model path
-        if not Path(model_path).exists():
+        model_file = Path(model_path)
+        if not model_file.exists():
              # Try looking in package directory
              pkg_dir = Path(__file__).parent
              if (pkg_dir / model_path).exists():
                  model_path = str(pkg_dir / model_path)
              # Try looking in sibling 'models' package (if installed via setup.py with models package)
-             elif (pkg_dir.parent / 'models' / Path(model_path).name).exists():
-                 model_path = str(pkg_dir.parent / 'models' / Path(model_path).name)
+             elif (pkg_dir.parent / 'models' / model_file.name).exists():
+                 model_path = str(pkg_dir.parent / 'models' / model_file.name)
              # Fallback to .pth if .kiri not found
-             elif model_path.endswith('.kiri') and (Path(model_path).parent / 'model.pth').exists():
-                 model_path = str(Path(model_path).parent / 'model.pth')
+             elif model_path.endswith('.kiri') and (model_file.parent / 'model.pth').exists():
+                 model_path = str(model_file.parent / 'model.pth')
+             # Check if it's a Hugging Face repo ID (e.g. "username/repo")
+             elif "/" in model_path and not model_path.startswith(".") and not model_path.startswith("/"):
+                 try:
+                     from huggingface_hub import hf_hub_download
+                     if self.verbose:
+                         print(f"⬇️ Downloading model from Hugging Face: {model_path}")
+                     
+                     # Download config.json to ensure download stats are tracked on HF
+                     try:
+                         hf_hub_download(repo_id=model_path, filename="config.json")
+                     except Exception:
+                         # Config might not exist for older uploads, ignore
+                         pass
+                         
+                     model_path = hf_hub_download(repo_id=model_path, filename="model.kiri")
+                 except Exception as e:
+                     if self.verbose:
+                         print(f"⚠️ Could not download from Hugging Face: {e}")
         
         if self.verbose:
             print(f"📦 Loading OCR model from {model_path}...")

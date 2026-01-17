@@ -38,9 +38,10 @@ def run_inference(args):
     output_dir = Path(args.output)
     output_dir.mkdir(exist_ok=True)
     
-    print("\n" + "="*70)
-    print("  📄 Kiri OCR System")
-    print("="*70)
+    if args.verbose:
+        print("\n" + "="*70)
+        print("  📄 Kiri OCR System")
+        print("="*70)
     
     try:
         # Initialize OCR
@@ -50,23 +51,28 @@ def run_inference(args):
             language=args.language,
             padding=args.padding,
             device=args.device,
-            verbose=True
+            verbose=args.verbose
         )
         
+        if not args.verbose:
+            print(f"Processing {args.image}...")
+
         # Process document & Extract text
-        full_text, results = ocr.extract_text(args.image, mode=args.mode, verbose=True)
+        full_text, results = ocr.extract_text(args.image, mode=args.mode, verbose=args.verbose)
         
         # Save text
         text_output = output_dir / 'extracted_text.txt'
         with open(text_output, 'w', encoding='utf-8') as f:
             f.write(full_text)
-        print(f"\n✓ Text saved to {text_output}")
+        if args.verbose:
+            print(f"\n✓ Text saved to {text_output}")
         
         # Save JSON
         json_output = output_dir / 'ocr_results.json'
         with open(json_output, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"✓ JSON saved to {json_output}")
+        if args.verbose:
+            print(f"✓ JSON saved to {json_output}")
         
         # Render results
         if not args.no_render:
@@ -93,14 +99,20 @@ def run_inference(args):
                 output_path=str(output_dir / 'report.html')
             )
         
-        print("\n" + "="*70)
-        print("  ✅ Processing Complete!")
-        print("="*70)
-        print(f"  Regions detected: {len(results)}")
-        if results:
-            print(f"  Average confidence: {np.mean([r['confidence'] for r in results])*100:.2f}%")
-        print(f"  Output directory: {output_dir}")
-        print("="*70 + "\n")
+        if args.verbose:
+            print("\n" + "="*70)
+            print("  ✅ Processing Complete!")
+            print("="*70)
+            print(f"  Regions detected: {len(results)}")
+            if results:
+                print(f"  Average confidence: {np.mean([r['confidence'] for r in results])*100:.2f}%")
+            print(f"  Output directory: {output_dir}")
+            print("="*70 + "\n")
+        else:
+            if results:
+                for res in results:
+                    print(res['text'])
+            print(f"\n✓ Saved results to {output_dir}")
         
     except Exception as e:
         print(f"\n❌ Error: {e}")
@@ -148,7 +160,7 @@ def main():
     # === PREDICT / RUN ===
     # Resolve default paths relative to package
     base_path = Path(__file__).parent
-    default_model = base_path / 'models' / 'model.kiri'
+    default_model = 'mrrtmob/kiri-ocr'
     default_charset = base_path / 'models' / 'charset_lite.txt'
 
     predict_parser = subparsers.add_parser('predict', help='Run OCR on an image')
@@ -169,6 +181,8 @@ def main():
                        help='Skip rendering (text only)')
     predict_parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu',
                        help='Device to use')
+    predict_parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose output')
     
     # === TRAIN ===
     train_parser = subparsers.add_parser('train', help='Train the OCR model')
