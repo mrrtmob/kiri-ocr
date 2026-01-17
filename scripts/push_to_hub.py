@@ -30,15 +30,14 @@ datasets:
 
 # {model_name}
 
-**Kiri OCR** is a lightweight, OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package (~13MB model).
+**Kiri OCR** is a lightweight, OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package.
 
 ## ✨ Key Features
 
-- **Lightweight**: Only ~13MB model size (Lite version).
+- **Lightweight**: Compact model optimized for speed and efficiency.
 - **Bi-lingual**: Native support for English and Khmer (and mixed).
 - **Document Processing**: Automatic text line and word detection.
 - **Robust Detection**: Works on both light and dark backgrounds (Dark Mode support).
-- **Visualizations**: Generate annotated images and HTML reports.
 
 ## 📊 Dataset
 

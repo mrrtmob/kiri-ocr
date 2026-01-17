@@ -3,20 +3,19 @@
 [![PyPI version](https://badge.fury.io/py/kiri-ocr.svg)](https://badge.fury.io/py/kiri-ocr)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python Versions](https://img.shields.io/pypi/pyversions/kiri-ocr.svg)](https://pypi.org/project/kiri-ocr/)
-[![Downloads](https://static.pepy.tech/badge/kiri-ocr)](https://pepy.tech/project/kiri-ocr)
+[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-yellow)](https://huggingface.co/mrrtmob/kiri-ocr)
 
-**Kiri OCR** is a lightweight, OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package (~13MB model).
+**Kiri OCR** is a lightweight, OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package.
 
 ![Kiri OCR](https://raw.githubusercontent.com/mrrtmob/kiri-ocr/main/assets/image.png)
 
 ## ✨ Key Features
 
-- **Lightweight**: Only ~13MB model size (Lite version).
+- **Lightweight**: Compact model optimized for speed and efficiency.
 - **Bi-lingual**: Native support for English and Khmer (and mixed).
 - **Document Processing**: Automatic text line and word detection.
 - **Robust Detection**: Works on both light and dark backgrounds (Dark Mode support).
 - **Easy to Use**: Simple Python API.
-- **Visualizations**: Generate annotated images and HTML reports.
 
 ## 📊 Dataset
 
