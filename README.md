@@ -14,12 +14,11 @@
 - **Lightweight**: Compact model optimized for speed and efficiency.
 - **Bi-lingual**: Native support for English and Khmer (and mixed).
 - **Document Processing**: Automatic text line and word detection.
-- **Robust Detection**: Works on both light and dark backgrounds (Dark Mode support).
 - **Easy to Use**: Simple Python API.
 
 ## 📊 Dataset
 
-The model is trained on the [mrrtmob/km_en_image_line](https://huggingface.co/datasets/mrrtmob/km_en_image_line) dataset, which contains **5 million** synthetic images of Khmer and English text lines.
+The model is trained on the [mrrtmob/khmer_english_ocr_image_line](https://huggingface.co/datasets/mrrtmob/khmer_english_ocr_image_line) dataset, which contains **12 million** synthetic images of Khmer and English text lines.
 
 ## 📈 Benchmark
 
