@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
 
 class TextDetector:
     """Detect text regions robustly across all background/text color conditions"""

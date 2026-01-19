@@ -1,14 +1,9 @@
-import numpy as np
 import json
 import argparse
 import sys
+import time
 from pathlib import Path
 import yaml
-
-from .core import OCR
-from .renderer import DocumentRenderer
-from .training import train_command
-from .generator import generate_command
 
 DEFAULT_TRAIN_CONFIG = {
     "height": 32,
@@ -34,6 +29,9 @@ def init_config(args):
     print(f"✓ Created default config at {path}")
 
 def run_inference(args):
+    import numpy as np
+    from .core import OCR
+    from .renderer import DocumentRenderer
     # Create output directory
     output_dir = Path(args.output)
     output_dir.mkdir(exist_ok=True)
@@ -56,7 +54,6 @@ def run_inference(args):
         
         if not args.verbose:
             print(f"Processing {args.image}...")
-
         # Process document & Extract text
         full_text, results = ocr.extract_text(args.image, mode=args.mode, verbose=args.verbose)
         
@@ -153,17 +150,64 @@ def merge_config(args, defaults):
         
     return args
 
+def print_banner(version="0.0.0"):
+    """Print ASCII art banner with version"""
+    banner = f"""
+╔════════════════════════════════════════════════════════════════╗
+║                                                                ║
+║     ██╗  ██╗██╗██████╗ ██╗      ██████╗  ██████╗██████╗        ║
+║     ██║ ██╔╝██║██╔══██╗██║     ██╔═══██╗██╔════╝██╔══██╗       ║
+║     █████╔╝ ██║██████╔╝██║     ██║   ██║██║     ██████╔╝       ║
+║     ██╔═██╗ ██║██╔══██╗██║     ██║   ██║██║     ██╔══██╗       ║
+║     ██║  ██╗██║██║  ██║██║     ╚██████╔╝╚██████╗██║  ██║       ║
+║     ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝      ╚═════╝  ╚═════╝╚═╝  ╚═╝       ║
+║                                                                ║
+║                                                                ║
+║                   Version: {version:^10}                          ║
+╚════════════════════════════════════════════════════════════════╝
+"""
+    print(banner)
+    
 def main():
-    parser = argparse.ArgumentParser(description='Kiri OCR - Command Line Tool')
-    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    start_setup = time.time()
+    try:
+        from . import __version__
+    except ImportError:
+        __version__ = "0.0.0"
+    
+    # Handle --version early, before subparsers
+    if '--version' in sys.argv:
+        print_banner(__version__)
+        sys.exit(0)
+        
+    # Show banner for help or no args
+    show_banner = len(sys.argv) == 1 or '-h' in sys.argv or '--help' in sys.argv
+    
+    if show_banner:
+        print_banner(__version__)
+    
+    parser = argparse.ArgumentParser(
+        description='Kiri OCR - Khmer & English OCR System',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False  # We'll add custom help
+    )
+    
+    # Custom help argument
+    parser.add_argument('-h', '--help', action='store_true', help='Show this help message and exit')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # === PREDICT / RUN ===
     # Resolve default paths relative to package
     base_path = Path(__file__).parent
     default_model = 'mrrtmob/kiri-ocr'
     default_charset = base_path / 'models' / 'charset_lite.txt'
-
-    predict_parser = subparsers.add_parser('predict', help='Run OCR on an image')
+    
+    predict_parser = subparsers.add_parser(
+        'predict', 
+        help='🔍 Run OCR on an image',
+        description='Extract text from document images'
+    )
     predict_parser.add_argument('image', help='Path to document image')
     predict_parser.add_argument('--mode', choices=['lines', 'words'], default='lines',
                        help='Detection mode (default: lines)')
@@ -185,7 +229,11 @@ def main():
                        help='Enable verbose output')
     
     # === TRAIN ===
-    train_parser = subparsers.add_parser('train', help='Train the OCR model')
+    train_parser = subparsers.add_parser(
+        'train', 
+        help='🎓 Train the OCR model',
+        description='Train or fine-tune an OCR model'
+    )
     train_parser.add_argument('--config', help='Path to config file (YAML/JSON)')
     train_parser.add_argument('--train-labels', help='Path to training labels file')
     train_parser.add_argument('--val-labels', help='Path to validation labels file')
@@ -208,7 +256,11 @@ def main():
     train_parser.add_argument('--weight-decay', type=float, help='Weight decay')
     
     # === GENERATE ===
-    gen_parser = subparsers.add_parser('generate', help='Generate synthetic data')
+    gen_parser = subparsers.add_parser(
+        'generate', 
+        help='🎨 Generate synthetic training data',
+        description='Create synthetic OCR training data from text files'
+    )
     gen_parser.add_argument('--train-file', '-t', required=True,
                        help='Training text file (one line per sample)')
     gen_parser.add_argument('--val-file', '-v', default=None,
@@ -231,20 +283,33 @@ def main():
                        help='Font selection mode: random (default) or all (iterate all fonts per line)')
     gen_parser.add_argument('--random-augment', action='store_true',
                        help='Apply random augmentations (noise, rotation) even if augmentation factor is 1')
-
+    
     # === INIT CONFIG ===
-    init_parser = subparsers.add_parser('init-config', help='Create default config file')
+    init_parser = subparsers.add_parser(
+        'init-config', 
+        help='⚙️  Create default config file',
+        description='Generate a default configuration file'
+    )
     init_parser.add_argument('--output', '-o', default='config.yaml', help='Output file')
-
+    
     # Backward compatibility logic
-    if len(sys.argv) > 1 and sys.argv[1] not in ['predict', 'train', 'generate', 'init-config', '-h', '--help']:
+    if len(sys.argv) > 1 and sys.argv[1] not in ['predict', 'train', 'generate', 'init-config', '-h', '--help', '--version']:
         sys.argv.insert(1, 'predict')
-        
+    
+    if len(sys.argv) > 1 and ('-v' in sys.argv or '--verbose' in sys.argv):
+        print(f"CLI Setup: {time.time()-start_setup:.3f}s", file=sys.stderr)
+    
     args = parser.parse_args()
+    
+    # Handle custom help
+    if hasattr(args, 'help') and args.help:
+        parser.print_help()
+        sys.exit(0)
     
     if args.command == 'predict':
         run_inference(args)
     elif args.command == 'train':
+        from .training import train_command
         # Merge config for training
         args = merge_config(args, DEFAULT_TRAIN_CONFIG)
         # Check required fields
@@ -254,6 +319,7 @@ def main():
             
         train_command(args)
     elif args.command == 'generate':
+        from .generator import generate_command
         generate_command(args)
     elif args.command == 'init-config':
         init_config(args)

@@ -7,11 +7,13 @@ from pathlib import Path
 import json
 
 from .model import LightweightOCR, CharacterSet
-from .detector import TextDetector
 
 class OCR:
     """Complete Document OCR System with Padding"""
     
+    # Cache loaded models to avoid reloading in the same process
+    _model_cache = {}
+
     def __init__(self, model_path='mrrtmob/kiri-ocr',
                  charset_path='models/charset_lite.txt',
                  language='mixed',
@@ -48,77 +50,113 @@ class OCR:
              # Check if it's a Hugging Face repo ID (e.g. "username/repo")
              elif "/" in model_path and not model_path.startswith(".") and not model_path.startswith("/"):
                  try:
+                     from huggingface_hub import try_to_load_from_cache
+                     # Quick check without downloading
+                     cached = try_to_load_from_cache(model_path, "model.kiri")
+                     if cached and str(cached) != "_CACHED_NO_EXIST":
+                         model_path = cached
+                 except ImportError:
+                     pass  # Fall back to current method
+
+                 try:
                      from huggingface_hub import hf_hub_download
-                     if self.verbose:
-                         print(f"⬇️ Downloading model from Hugging Face: {model_path}")
                      
-                     # Download config.json to ensure download stats are tracked on HF
+                     # Try local cache first
                      try:
-                         hf_hub_download(repo_id=model_path, filename="config.json")
+                        resolved_path = hf_hub_download(repo_id=model_path, filename="model.kiri", local_files_only=True)
+                        if self.verbose:
+                             print(f"📦 Found model in local cache: {model_path}")
+                        model_path = resolved_path
                      except Exception:
-                         # Config might not exist for older uploads, ignore
-                         pass
-                         
-                     model_path = hf_hub_download(repo_id=model_path, filename="model.kiri")
+                        # Fallback to online
+                        if self.verbose:
+                            print(f"⬇️ Downloading model from Hugging Face: {model_path}")
+                        
+                        # Download config.json to ensure download stats are tracked on HF
+                        try:
+                            hf_hub_download(repo_id=model_path, filename="config.json")
+                        except Exception:
+                            # Config might not exist for older uploads, ignore
+                            pass
+                            
+                        model_path = hf_hub_download(repo_id=model_path, filename="model.kiri")
                  except Exception as e:
                      if self.verbose:
                          print(f"⚠️ Could not download from Hugging Face: {e}")
         
-        if self.verbose:
-            print(f"📦 Loading OCR model from {model_path}...")
-        
-        try:
-            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        # Check memory cache
+        cache_key = (str(model_path), device)
+        if cache_key in OCR._model_cache:
+            if self.verbose:
+                print(f"⚡ Loading model from memory cache")
+            self.model, self.charset = OCR._model_cache[cache_key]
+        else:
+            if self.verbose:
+                print(f"📦 Loading OCR model from {model_path}...")
             
-            # Load charset
-            if 'charset' in checkpoint:
-                if self.verbose:
-                    print(f"  ✓ Found embedded charset ({len(checkpoint['charset'])} chars)")
-                self.charset = CharacterSet.from_checkpoint(checkpoint)
-            else:
-                # Fallback to charset file
-                if not Path(charset_path).exists():
-                     # Try looking in package directory if not found locally
-                     pkg_dir = Path(__file__).parent
-                     if (pkg_dir / charset_path).exists():
-                         charset_path = str(pkg_dir / charset_path)
+            try:
+                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+                
+                # Load charset
+                if 'charset' in checkpoint:
+                    if self.verbose:
+                        print(f"  ✓ Found embedded charset ({len(checkpoint['charset'])} chars)")
+                    self.charset = CharacterSet.from_checkpoint(checkpoint)
+                else:
+                    # Fallback to charset file
+                    if not Path(charset_path).exists():
+                        # Try looking in package directory if not found locally
+                        pkg_dir = Path(__file__).parent
+                        if (pkg_dir / charset_path).exists():
+                            charset_path = str(pkg_dir / charset_path)
+                    
+                    if self.verbose:
+                        print(f"  ℹ️ Loading charset from file: {charset_path}")
+                    self.charset = CharacterSet.load(charset_path)
+                
+                # Initialize model
+                self.model = LightweightOCR(num_chars=len(self.charset)).eval()
+                
+                # Load weights
+                if 'model_state_dict' in checkpoint:
+                    self.model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    # Assume checkpoint IS state_dict (legacy/raw save)
+                    self.model.load_state_dict(checkpoint)
+                
+                self.model = self.model.to(device)
+                
+                # Update cache
+                OCR._model_cache[cache_key] = (self.model, self.charset)
                 
                 if self.verbose:
-                    print(f"  ℹ️ Loading charset from file: {charset_path}")
-                self.charset = CharacterSet.load(charset_path)
-            
-            # Initialize model
-            self.model = LightweightOCR(num_chars=len(self.charset)).eval()
-            
-            # Load weights
-            if 'model_state_dict' in checkpoint:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                # Assume checkpoint IS state_dict (legacy/raw save)
-                self.model.load_state_dict(checkpoint)
-                
-        except RuntimeError as e:
-            if "size mismatch" in str(e):
-                print(f"\n❌ Error loading model: {e}")
-                print("\n⚠️  CRITICAL: The model weights do not match the character set.")
-                print(f"    - Charset size: {len(self.charset)}")
-                print(f"    - Model file:   {model_path}")
-                sys.exit(1)
-            else:
+                    print(f"✓ Model loaded ({len(self.charset)} characters)")
+                    print(f"✓ Box padding: {padding}px")
+
+            except RuntimeError as e:
+                if "size mismatch" in str(e):
+                    print(f"\n❌ Error loading model: {e}")
+                    print("\n⚠️  CRITICAL: The model weights do not match the character set.")
+                    print(f"    - Charset size: {len(self.charset)}")
+                    print(f"    - Model file:   {model_path}")
+                    sys.exit(1)
+                else:
+                    raise e
+            except Exception as e:
+                print(f"❌ Error loading model: {e}")
                 raise e
-        except Exception as e:
-            print(f"❌ Error loading model: {e}")
-            raise e
-        
-        self.model = self.model.to(device)
-        
-        if self.verbose:
-            print(f"✓ Model loaded ({len(self.charset)} characters)")
-            print(f"✓ Box padding: {padding}px")
         
         # Detector
-        self.detector = TextDetector()
+        self._detector = None
     
+    @property
+    def detector(self):
+        """Lazy-load detector only when needed"""
+        if self._detector is None:
+            from .detector import TextDetector
+            self._detector = TextDetector()
+        return self._detector
+
     def _preprocess_region(self, img, box, extra_padding=5):
         """
         Crop and preprocess a region with extra padding
