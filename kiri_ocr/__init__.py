@@ -3,7 +3,7 @@ from .renderer import DocumentRenderer
 from .model import LightweightOCR, CharacterSet
 from .detector import TextDetector
 
-__version__ = '0.1.5'
+__version__ = '0.1.6'
 
 __all__ = [
     'OCR',
