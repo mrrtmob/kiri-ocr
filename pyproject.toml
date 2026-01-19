@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kiri_ocr"
-version = "0.1.6"
+version = "0.1.7"
 description = "A lightweight OCR library for Khmer and English documents"
 authors = [
     {name = "Blizzer"}
@@ -17,7 +17,6 @@ dependencies = [
     "Pillow>=9.0.0",
     "tqdm>=4.65.0",
     "matplotlib>=3.7.0",
-    "scipy",
     "datasets>=2.14.0",
     "huggingface_hub>=0.16.0",
     "PyYAML"
