@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from PIL import Image
 import numpy as np
 import os
@@ -60,6 +60,72 @@ class OCRDataset(Dataset):
         target = torch.LongTensor(target)
 
         return img, target, text
+
+
+class HFIterableOCRDataset(IterableDataset):
+    def __init__(
+        self, dataset, charset, img_height=32, image_col="image", text_col="text"
+    ):
+        if load_dataset is None:
+            raise ImportError("Please install 'datasets' library: pip install datasets")
+
+        self.img_height = img_height
+        self.charset = charset
+        self.image_col = image_col
+        self.text_col = text_col
+        self.dataset = dataset
+
+        # Iterate to build charset if needed
+        if len(charset) < 10:
+            print(f"  🔄 Scanning charset from '{text_col}' column (Streaming)...")
+            count = 0
+            # Scan first 5000 samples for safety
+            max_scan = 5000
+            for i, item in enumerate(dataset):
+                if i >= max_scan:
+                    break
+                text = item.get(text_col, "")
+                if text:
+                    charset.add_chars(text)
+                count += 1
+                if count % 100 == 0:
+                    print(f"    Scanned {count} samples...", end='\r')
+            print(f"    Scanned {count} samples. Done.")
+        else:
+            print(f"  ℹ️  Skipping charset scan (charset already has {len(charset)} chars)")
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        ds = self.dataset
+        if worker_info is not None:
+             if hasattr(ds, 'shard'):
+                 try:
+                    ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+                 except:
+                    pass
+        
+        for item in ds:
+            try:
+                img = item[self.image_col]
+                text = item[self.text_col]
+
+                if img.mode != "L":
+                    img = img.convert("L")
+
+                w, h = img.size
+                new_h = self.img_height
+                new_w = int(w * new_h / h)
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+
+                img = np.array(img).astype(np.float32) / 255.0
+                img = torch.FloatTensor(img).unsqueeze(0)
+
+                target = self.charset.encode(text)
+                target = torch.LongTensor(target)
+
+                yield img, target, text
+            except Exception:
+                continue
 
 
 class HFOCRDataset(Dataset):
@@ -216,38 +282,42 @@ def train_model(
         correct = 0
         total = 0
 
-        with torch.no_grad():
-            for images, targets, target_lengths, texts in val_loader:
-                images = images.to(device)
-                targets = targets.to(device)
-                target_lengths = target_lengths.to(device)
+        if len(val_loader) > 0:
+            with torch.no_grad():
+                for images, targets, target_lengths, texts in val_loader:
+                    images = images.to(device)
+                    targets = targets.to(device)
+                    target_lengths = target_lengths.to(device)
 
-                outputs = model(images)
+                    outputs = model(images)
 
-                input_lengths = torch.full(
-                    size=(outputs.size(1),),
-                    fill_value=outputs.size(0),
-                    dtype=torch.long,
-                    device=device,
-                )
+                    input_lengths = torch.full(
+                        size=(outputs.size(1),),
+                        fill_value=outputs.size(0),
+                        dtype=torch.long,
+                        device=device,
+                    )
 
-                log_probs = nn.functional.log_softmax(outputs, dim=2)
-                loss = criterion(log_probs, targets, input_lengths, target_lengths)
-                val_loss += loss.item()
+                    log_probs = nn.functional.log_softmax(outputs, dim=2)
+                    loss = criterion(log_probs, targets, input_lengths, target_lengths)
+                    val_loss += loss.item()
 
-                # Accuracy
-                _, preds = outputs.max(2)
-                preds = preds.transpose(0, 1)
+                    # Accuracy
+                    _, preds = outputs.max(2)
+                    preds = preds.transpose(0, 1)
 
-                for i, text in enumerate(texts):
-                    pred_indices = preds[i].cpu().numpy()
-                    pred_text = charset.decode(pred_indices)
-                    if pred_text == text:
-                        correct += 1
-                    total += 1
+                    for i, text in enumerate(texts):
+                        pred_indices = preds[i].cpu().numpy()
+                        pred_text = charset.decode(pred_indices)
+                        if pred_text == text:
+                            correct += 1
+                        total += 1
 
-        val_loss /= len(val_loader)
-        accuracy = correct / total * 100
+            val_loss /= len(val_loader)
+            accuracy = correct / total * 100 if total > 0 else 0
+        else:
+            val_loss = 0
+            accuracy = 0
 
         scheduler.step(val_loss)
 
@@ -359,10 +429,14 @@ def train_command(args):
     if hasattr(args, "hf_dataset") and args.hf_dataset:
         print(f"  ⬇️ Loading HF dataset: {args.hf_dataset}")
         subset = getattr(args, "hf_subset", None)
+        streaming = getattr(args, "hf_streaming", False)
+
+        if streaming:
+            print("  🌊 Streaming mode enabled")
 
         # Load train split
         try:
-            ds = load_dataset(args.hf_dataset, subset, split=args.hf_train_split)
+            ds = load_dataset(args.hf_dataset, subset, split=args.hf_train_split, streaming=streaming)
         except Exception as e:
             print(f"❌ Error loading dataset: {e}")
             return
@@ -378,7 +452,7 @@ def train_command(args):
                 continue
             try:
                 # We check if we can load it
-                candidate = load_dataset(args.hf_dataset, subset, split=split)
+                candidate = load_dataset(args.hf_dataset, subset, split=split, streaming=streaming)
                 val_ds = candidate
                 print(f"  ✓ Found validation split: '{split}'")
                 break
@@ -386,31 +460,50 @@ def train_command(args):
                 pass
 
         if val_ds is None:
-            print(
-                f"  ⚠️ No validation split found. Splitting {args.hf_val_percent*100}% from train..."
-            )
-            try:
-                split_ds = ds.train_test_split(test_size=args.hf_val_percent)
-                ds = split_ds["train"]
-                val_ds = split_ds["test"]
-            except Exception as e:
-                print(f"  ⚠️ Could not split dataset: {e}. Using train for validation.")
-                val_ds = ds
+            if not streaming:
+                print(
+                    f"  ⚠️ No validation split found. Splitting {args.hf_val_percent*100}% from train..."
+                )
+                try:
+                    split_ds = ds.train_test_split(test_size=args.hf_val_percent)
+                    ds = split_ds["train"]
+                    val_ds = split_ds["test"]
+                except Exception as e:
+                    print(f"  ⚠️ Could not split dataset: {e}. Using train for validation.")
+                    val_ds = ds
+            else:
+                 print(f"  ⚠️ No validation split found and streaming is on. Validation will be skipped.")
 
-        train_dataset = HFOCRDataset(
-            ds,
-            charset,
-            img_height=IMAGE_HEIGHT,
-            image_col=args.hf_image_col,
-            text_col=args.hf_text_col,
-        )
-        val_dataset = HFOCRDataset(
-            val_ds,
-            charset,
-            img_height=IMAGE_HEIGHT,
-            image_col=args.hf_image_col,
-            text_col=args.hf_text_col,
-        )
+        if streaming:
+            train_dataset = HFIterableOCRDataset(
+                ds,
+                charset,
+                img_height=IMAGE_HEIGHT,
+                image_col=args.hf_image_col,
+                text_col=args.hf_text_col,
+            )
+            val_dataset = HFIterableOCRDataset(
+                val_ds,
+                charset,
+                img_height=IMAGE_HEIGHT,
+                image_col=args.hf_image_col,
+                text_col=args.hf_text_col,
+            ) if val_ds else None
+        else:
+            train_dataset = HFOCRDataset(
+                ds,
+                charset,
+                img_height=IMAGE_HEIGHT,
+                image_col=args.hf_image_col,
+                text_col=args.hf_text_col,
+            )
+            val_dataset = HFOCRDataset(
+                val_ds,
+                charset,
+                img_height=IMAGE_HEIGHT,
+                image_col=args.hf_image_col,
+                text_col=args.hf_text_col,
+            )
     else:
         if not os.path.exists(args.train_labels):
             print(f"❌ Training labels not found: {args.train_labels}")
@@ -426,7 +519,9 @@ def train_command(args):
             )
             val_dataset = train_dataset
 
-    print(f"\n📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val")
+    train_len = len(train_dataset) if hasattr(train_dataset, "__len__") else "Unknown (Streaming)"
+    val_len = len(val_dataset) if val_dataset and hasattr(val_dataset, "__len__") else ("Unknown (Streaming)" if val_dataset else 0)
+    print(f"\n📊 Dataset: {train_len} train, {val_len} val")
     print(f"📝 Characters: {len(charset)}\n")
     
     # Clear memory before training
@@ -445,13 +540,16 @@ def train_command(args):
         num_workers=4 if device == "cuda" else 0,
         collate_fn=collate_fn,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4 if device == "cuda" else 0,
-        collate_fn=collate_fn,
-    )
+    if val_dataset:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=4 if device == "cuda" else 0,
+            collate_fn=collate_fn,
+        )
+    else:
+        val_loader = []
 
     model = LightweightOCR(num_chars=len(charset), hidden_size=HIDDEN_SIZE)
 

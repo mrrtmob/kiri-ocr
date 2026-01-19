@@ -193,6 +193,7 @@ def main():
     train_parser.add_argument('--hf-subset', help='HuggingFace dataset subset/config name')
     train_parser.add_argument('--hf-train-split', default='train', help='Train split name (default: train)')
     train_parser.add_argument('--hf-val-split', help='Validation split name')
+    train_parser.add_argument('--hf-streaming', action='store_true', help='Use streaming for HuggingFace dataset')
     train_parser.add_argument('--hf-image-col', default='image', help='Image column name')
     train_parser.add_argument('--hf-text-col', default='text', help='Text column name')
     train_parser.add_argument('--hf-val-percent', type=float, default=0.1, help='Val % if no split found (default: 0.1)')
