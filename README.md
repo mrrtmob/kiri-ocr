@@ -5,8 +5,11 @@
 [![Python Versions](https://img.shields.io/pypi/pyversions/kiri-ocr.svg)](https://pypi.org/project/kiri-ocr/)
 [![Downloads](https://static.pepy.tech/badge/kiri-ocr)](https://pepy.tech/project/kiri-ocr)
 [![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-yellow)](https://huggingface.co/mrrtmob/kiri-ocr)
+[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/mrrtmob/kiri-ocr)
 
 **Kiri OCR** is a lightweight, OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities in a compact package.
+
+[**🚀 Try the Live Demo**](https://huggingface.co/spaces/mrrtmob/kiri-ocr)
 
 ![Kiri OCR](https://raw.githubusercontent.com/mrrtmob/kiri-ocr/main/assets/image.png)
 
@@ -166,6 +169,7 @@ kiri-ocr train \
 * `--hf-image-col`: Column name for images (default: "image").
 * `--hf-text-col`: Column name for text labels (default: "text").
 * `--hf-subset`: Dataset configuration/subset name (optional).
+* `--hf-streaming`: Stream the dataset instead of downloading it fully.
 
 To use a specific subset/config (if the dataset has multiple):
 
