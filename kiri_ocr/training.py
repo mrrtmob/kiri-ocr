@@ -533,10 +533,12 @@ def train_command(args):
     os.makedirs(args.output_dir, exist_ok=True)
     # charset.save(f'{args.output_dir}/charset_lite.txt') # Not needed if using .kiri
 
+    # shuffle=True is not supported for IterableDataset
+    is_iterable = isinstance(train_dataset, IterableDataset)
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=not is_iterable,
         num_workers=4 if device == "cuda" else 0,
         collate_fn=collate_fn,
     )
