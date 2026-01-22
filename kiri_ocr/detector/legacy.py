@@ -1,11 +1,11 @@
 import cv2
 import numpy as np
+import os
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Union
 from enum import Enum
 from pathlib import Path
 import warnings
-
 
 class DetectionLevel(Enum):
     """Detection granularity levels"""
@@ -54,9 +54,9 @@ class TextBox:
         return f"TextBox({self.x}, {self.y}, {self.width}, {self.height}, conf={self.confidence:.2f})"
 
 
-class TextDetector:
+class ImageProcessingTextDetector:
     """
-    Advanced Text Detector.
+    Advanced Text Detector (Classic Computer Vision Approach).
     
     Detects text regions robustly across ALL background/text color conditions
     using multiple detection strategies:
@@ -69,7 +69,7 @@ class TextDetector:
     6. Projection profile analysis for line segmentation
     
     Example:
-        detector = TextDetector()
+        detector = ImageProcessingTextDetector()
         lines = detector.detect_lines("image.png")
         words = detector.detect_words("image.png")
         hierarchy = detector.detect_all("image.png")  # Full hierarchy
@@ -89,7 +89,7 @@ class TextDetector:
         debug: bool = False
     ):
         """
-        Initialize the TextDetector.
+        Initialize the ImageProcessingTextDetector.
         
         Args:
             padding: Pixels to add around detected boxes (None = auto-calculate)
@@ -1136,23 +1136,3 @@ class TextDetector:
         px, py = point
         x, y, w, h = bbox
         return x <= px <= x + w and y <= py <= y + h
-
-
-# ==================== CONVENIENCE FUNCTIONS ====================
-
-def detect_text_lines(image: Union[str, Path, np.ndarray], **kwargs) -> List[Tuple[int, int, int, int]]:
-    """Convenience function to detect text lines."""
-    detector = TextDetector(**kwargs)
-    return detector.detect_lines(image)
-
-
-def detect_text_words(image: Union[str, Path, np.ndarray], **kwargs) -> List[Tuple[int, int, int, int]]:
-    """Convenience function to detect text words."""
-    detector = TextDetector(**kwargs)
-    return detector.detect_words(image)
-
-
-def detect_text_blocks(image: Union[str, Path, np.ndarray], **kwargs) -> List[Tuple[int, int, int, int]]:
-    """Convenience function to detect text blocks."""
-    detector = TextDetector(**kwargs)
-    return detector.detect_blocks(image)

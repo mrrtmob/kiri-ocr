@@ -284,16 +284,45 @@ def main():
     gen_parser.add_argument('--random-augment', action='store_true',
                        help='Apply random augmentations (noise, rotation) even if augmentation factor is 1')
     
+    # === GENERATE DETECTOR DATASET ===
+    gen_det_parser = subparsers.add_parser(
+        'generate-detector',
+        help='🖼️ Generate detector training data',
+        description='Create synthetic dataset for YOLO detector'
+    )
+    gen_det_parser.add_argument('--text-file', required=True, help='Path to text file')
+    gen_det_parser.add_argument('--fonts-dir', default='fonts', help='Directory containing fonts (random selection)')
+    gen_det_parser.add_argument('--font', help='Specific font file (overrides fonts-dir)')
+    gen_det_parser.add_argument('--output', default='detector_dataset', help='Output directory')
+    gen_det_parser.add_argument('--num-train', type=int, default=800, help='Number of training images')
+    gen_det_parser.add_argument('--num-val', type=int, default=200, help='Number of validation images')
+    gen_det_parser.add_argument('--min-lines', type=int, default=3, help='Min text lines per page')
+    gen_det_parser.add_argument('--max-lines', type=int, default=20, help='Max text lines per page')
+    gen_det_parser.add_argument('--no-augment', action='store_true', help='Disable augmentation')
+
+    # === TRAIN DETECTOR ===
+    train_det_parser = subparsers.add_parser(
+        'train-detector',
+        help='🎯 Train detector model',
+        description='Train YOLO model for text detection'
+    )
+    train_det_parser.add_argument('--data-yaml', default='detector_dataset/data.yaml', help='Path to data.yaml')
+    train_det_parser.add_argument('--model-size', choices=['n', 's', 'm', 'l', 'x'], default='n', help='YOLO model size')
+    train_det_parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    train_det_parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
+    train_det_parser.add_argument('--image-size', type=int, default=640, help='Image size')
+    train_det_parser.add_argument('--name', default='khmer_text_detector', help='Project name')
+
     # === INIT CONFIG ===
     init_parser = subparsers.add_parser(
-        'init-config', 
+        'init-config',
         help='⚙️  Create default config file',
         description='Generate a default configuration file'
     )
     init_parser.add_argument('--output', '-o', default='config.yaml', help='Output file')
     
     # Backward compatibility logic
-    if len(sys.argv) > 1 and sys.argv[1] not in ['predict', 'train', 'generate', 'init-config', '-h', '--help', '--version']:
+    if len(sys.argv) > 1 and sys.argv[1] not in ['predict', 'train', 'generate', 'init-config', 'generate-detector', 'train-detector', '-h', '--help', '--version']:
         sys.argv.insert(1, 'predict')
     
     if len(sys.argv) > 1 and ('-v' in sys.argv or '--verbose' in sys.argv):
@@ -321,6 +350,12 @@ def main():
     elif args.command == 'generate':
         from .generator import generate_command
         generate_command(args)
+    elif args.command == 'generate-detector':
+        from .detector.dataset import generate_detector_dataset_command
+        generate_detector_dataset_command(args)
+    elif args.command == 'train-detector':
+        from .detector.training import train_detector_command
+        train_detector_command(args)
     elif args.command == 'init-config':
         init_config(args)
     else:

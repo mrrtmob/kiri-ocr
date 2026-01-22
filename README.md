@@ -123,7 +123,7 @@ img_002.jpg    This is a test
 
 *Note: Images must be in an `images/` subdirectory relative to the `labels.txt` file.*
 
-### Step 2: Train the Model
+### Step 2: Train the Recognition Model
 
 You can train using CLI arguments or a configuration file.
 
@@ -180,9 +180,41 @@ kiri-ocr train \
     ...
 ```
 
-### Fine-Tuning
+### Step 3: Train the Detector (Optional)
 
-To fine-tune an existing model on new data:
+Kiri OCR uses a YOLOv8-based detector to find text regions on a page. You can train this on your own data if needed.
+
+1. **Generate Detector Dataset**:
+
+   ```bash
+   kiri-ocr generate-detector \
+       --text-file data/textlines.txt \
+       --fonts-dir fonts \
+       --min-lines 5 \
+       --max-lines 15
+   ```
+
+   This creates a `detector_dataset/` directory with synthetic document images.
+2. **Train Detector**:
+
+   ```bash
+   kiri-ocr train-detector \
+       --epochs 50 \
+       --model-size n
+   ```
+
+   * `--model-size`: 'n' (nano), 's' (small), 'm' (medium). 'n' is fastest.
+3. **Use Custom Detector**:
+   The system will automatically look for the trained model in `runs/detect/khmer_text_detector/weights/best.pt`. You can also specify it in Python:
+
+   ```python
+   from kiri_ocr.detector import TextDetector
+   detector = TextDetector(method='yolo', model_path='path/to/best.pt')
+   ```
+
+### Fine-Tuning Recognition
+
+To fine-tune an existing recognition model on new data:
 
 ```bash
 kiri-ocr train \
