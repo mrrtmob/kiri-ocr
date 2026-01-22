@@ -186,15 +186,30 @@ Kiri OCR uses a YOLOv8-based detector to find text regions on a page. You can tr
 
 1. **Generate Detector Dataset**:
 
+   Create a synthetic dataset for training the YOLO object detector. This command generates page-like images with multiple text lines.
+
    ```bash
    kiri-ocr generate-detector \
        --text-file data/textlines.txt \
        --fonts-dir fonts \
-       --min-lines 5 \
-       --max-lines 15
+       --output detector_dataset \
+       --num-train 1000 \
+       --num-val 200
    ```
 
-   This creates a `detector_dataset/` directory with synthetic document images.
+   **Arguments:**
+
+   * `--text-file`: Path to source text file (one line per text sample).
+   * `--fonts-dir`: Directory containing `.ttf` font files to randomly select from.
+   * `--font`: (Optional) Use a specific font file instead of a directory.
+   * `--output`: Output directory for the dataset (default: `detector_dataset`).
+   * `--num-train`: Number of training images to generate (default: 800).
+   * `--num-val`: Number of validation images to generate (default: 200).
+   * `--min-lines`: Minimum number of text lines per generated page (default: 3).
+   * `--max-lines`: Maximum number of text lines per generated page (default: 20).
+   * `--no-augment`: Disable random augmentations (noise, blur, etc.).
+
+   This creates a `detector_dataset/` directory structured for YOLO training (containing `train/`, `val/`, and `data.yaml`).
 2. **Train Detector**:
 
    ```bash

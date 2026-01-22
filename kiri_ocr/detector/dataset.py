@@ -9,8 +9,6 @@ from tqdm import tqdm
 try:
     from ..generator import FontManager
 except ImportError:
-    # Fallback if generator not found (e.g. running standalone)
-    # This might fail if relative import fails, so try absolute or assume installed
     try:
         from kiri_ocr.generator import FontManager
     except ImportError:
@@ -22,7 +20,6 @@ class DetectorDatasetGenerator:
         self.fonts_dir = fonts_dir
         self.font_manager = None
         if FontManager:
-            # We use FontManager to find fonts, but we'll use paths to load with random sizes
             self.font_manager = FontManager(fonts_dir=fonts_dir)
         
         self.setup_directories()
@@ -38,7 +35,7 @@ class DetectorDatasetGenerator:
         for d in dirs:
             os.makedirs(d, exist_ok=True)
     
-    def load_khmer_text(self, text_file):
+    def load_text(self, text_file):
         """Load Khmer text from file"""
         with open(text_file, 'r', encoding='utf-8') as f:
             lines = [line.strip() for line in f.readlines() if line.strip()]
@@ -70,9 +67,8 @@ class DetectorDatasetGenerator:
         return random.choice(colors)
     
     def _is_text_supported(self, font, text):
-        """Check if font supports the characters in text (detects 'tofu' boxes)"""
+        """Check if font supports the characters in text"""
         try:
-            # Get the glyph for a strictly undefined character to use as reference
             undefined_chars = ['\uFFFF', '\U0010FFFF', '\0']
             ref_mask = None
             ref_bbox = None
@@ -87,13 +83,11 @@ class DetectorDatasetGenerator:
                     continue
             
             if ref_mask is None:
-                # Can't determine reference, assume supported
                 return True
 
             ref_bytes = bytes(ref_mask)
 
             for char in text:
-                # Skip spaces and control characters
                 if char.isspace() or ord(char) < 32:
                     continue
                     
@@ -101,11 +95,8 @@ class DetectorDatasetGenerator:
                     char_mask = font.getmask(char)
                     char_bbox = char_mask.getbbox()
                     
-                    # Compare with reference "notdef" glyph
                     if char_bbox == ref_bbox:
-                        # Exact bbox match. Deep check bytes.
                         if bytes(char_mask) == ref_bytes:
-                            # It's a tofu/box!
                             return False
                 except Exception:
                     return False
@@ -118,23 +109,23 @@ class DetectorDatasetGenerator:
         """Apply random augmentations to the full page image"""
         img_array = np.array(image)
         
-        # 1. Noise (Gaussian)
+        # Gaussian Noise
         if random.random() > 0.5:
             noise = np.random.normal(0, random.randint(5, 20), img_array.shape)
             img_array = np.clip(img_array + noise, 0, 255).astype(np.uint8)
             
-        # 2. Blur
+        # Blur
         if random.random() > 0.6:
             ksize = random.choice([3, 5])
             img_array = cv2.GaussianBlur(img_array, (ksize, ksize), 0)
             
-        # 3. Brightness/Contrast
+        # Brightness/Contrast
         if random.random() > 0.5:
-            alpha = random.uniform(0.8, 1.2) # Contrast
-            beta = random.randint(-30, 30)   # Brightness
+            alpha = random.uniform(0.8, 1.2)
+            beta = random.randint(-30, 30)
             img_array = cv2.convertScaleAbs(img_array, alpha=alpha, beta=beta)
             
-        # 4. JPEG Compression artifacts
+        # JPEG Compression
         if random.random() > 0.5:
             quality = random.randint(50, 95)
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
@@ -143,10 +134,66 @@ class DetectorDatasetGenerator:
 
         return Image.fromarray(img_array)
     
+    def check_overlap(self, new_bbox, existing_bboxes, min_spacing=20):
+        """Check if new bbox overlaps with existing ones"""
+        y1_new, y2_new = new_bbox[1], new_bbox[3]
+        
+        for bbox in existing_bboxes:
+            y1_exist, y2_exist = bbox[1], bbox[3]
+            
+            # Check vertical overlap with spacing buffer
+            if not (y2_new + min_spacing < y1_exist or y1_new > y2_exist + min_spacing):
+                return True
+        return False
+    
+    def combine_texts_for_line(self, texts, min_words=2, max_words=5):
+        """Combine multiple text segments into one line"""
+        num_words = random.randint(min_words, max_words)
+        selected = random.sample(texts, min(num_words, len(texts)))
+        # Join with space
+        return ' '.join(selected)
+    
+    def measure_line_bbox(self, draw, line_parts, font, start_x, start_y):
+        """Measure the complete bounding box for a line with multiple text parts"""
+        current_x = start_x
+        min_x = start_x
+        max_x = start_x
+        min_y = start_y
+        max_y = start_y
+        
+        for text_part in line_parts:
+            try:
+                try:
+                    bbox = draw.textbbox((current_x, start_y), text_part, font=font)
+                    text_width = bbox[2] - bbox[0]
+                    text_height = bbox[3] - bbox[1]
+                    
+                    # Track extremes
+                    min_x = min(min_x, bbox[0])
+                    max_x = max(max_x, bbox[2])
+                    min_y = min(min_y, bbox[1])
+                    max_y = max(max_y, bbox[3])
+                    
+                except AttributeError:
+                    text_width, text_height = draw.textsize(text_part, font=font)
+                    max_x = current_x + text_width
+                    max_y = start_y + text_height
+                
+                current_x += text_width + random.randint(10, 30)  # Word spacing
+                
+            except Exception:
+                continue
+        
+        total_width = max_x - min_x
+        total_height = max_y - min_y
+        
+        return min_x, min_y, max_x, max_y, total_width, total_height
+    
     def generate_single_image(self, texts, image_idx, split='train', 
                               min_lines=3, max_lines=10, augment=True, 
-                              specific_font_path=None):
-        """Generate a single image with multiple text regions"""
+                              specific_font_path=None,
+                              min_words_per_line=2, max_words_per_line=5):
+        """Generate image with multiple words per line, one bbox per line"""
         
         # Image dimensions
         img_width = random.randint(800, 1200)
@@ -158,46 +205,63 @@ class DetectorDatasetGenerator:
         draw = ImageDraw.Draw(image)
         
         # Determine number of lines
-        num_lines = random.randint(min_lines, min(max_lines, len(texts)))
-        selected_texts = random.sample(texts, num_lines)
+        num_lines = random.randint(min_lines, max_lines)
         
-        # Annotations (YOLO format)
+        # Annotations and tracking
         annotations = []
+        existing_bboxes = []
         
-        # Layout strategy
+        # Layout parameters
         y_offset = random.randint(50, 100)
         x_margin = random.randint(50, 100)
-        line_spacing = random.randint(10, 40)
         
-        # Common text color for the page
+        # Line spacing
+        MIN_LINE_SPACING = 40
+        MAX_LINE_SPACING = 60
+        
+        # Common text color
         text_color = self.get_random_text_color()
         
-        # Extract unique font paths for random selection
+        # Font paths
         available_font_paths = []
         if self.font_manager and self.font_manager.all_fonts:
             available_font_paths = list(set([f[0] for f in self.font_manager.all_fonts]))
         
-        for text in selected_texts:
-            font_size = random.randint(24, 48)
+        successful_lines = 0
+        max_attempts = num_lines * 3
+        
+        for attempt in range(max_attempts):
+            if successful_lines >= num_lines:
+                break
+            
+            # Create line with multiple words
+            num_words = random.randint(min_words_per_line, max_words_per_line)
+            line_texts = random.sample(texts, min(num_words, len(texts)))
+            
+            # Font size
+            font_size = random.randint(28, 52)
             font = None
             
-            # Try specific font first
+            # Try specific font
             if specific_font_path:
                 try:
                     candidate = ImageFont.truetype(specific_font_path, font_size)
-                    if self._is_text_supported(candidate, text):
+                    # Check if all texts in line are supported
+                    all_supported = all(self._is_text_supported(candidate, t) for t in line_texts)
+                    if all_supported:
                         font = candidate
                 except:
                     pass
             
-            # Random font selection with retry
+            # Random font selection
             if font is None and available_font_paths:
                 retries = 10
                 for _ in range(retries):
                     random_path = random.choice(available_font_paths)
                     try:
                         candidate = ImageFont.truetype(random_path, font_size)
-                        if self._is_text_supported(candidate, text):
+                        all_supported = all(self._is_text_supported(candidate, t) for t in line_texts)
+                        if all_supported:
                             font = candidate
                             break
                     except:
@@ -205,77 +269,108 @@ class DetectorDatasetGenerator:
             
             # Fallback
             if font is None:
-                 font = ImageFont.load_default()
-
-            # Get text bounding box (with error handling)
-            try:
-                try:
-                    bbox = draw.textbbox((0, 0), text, font=font)
-                    text_width = bbox[2] - bbox[0]
-                    text_height = bbox[3] - bbox[1]
-                except AttributeError:
-                    # Fallback for older Pillow
-                    text_width, text_height = draw.textsize(text, font=font)
-                    bbox = (0, 0, text_width, text_height)
-            except Exception:
-                # Skip line if measurement fails
+                font = ImageFont.load_default()
+            
+            # Layout alignment
+            align = random.choice(['left', 'center', 'random'])
+            
+            # Pre-measure the complete line to check if it fits
+            temp_x = x_margin
+            min_x, min_y, max_x, max_y, total_width, total_height = \
+                self.measure_line_bbox(draw, line_texts, font, temp_x, y_offset)
+            
+            # Skip if text is too small or too large
+            if total_height < 20 or total_width > img_width - 2 * x_margin:
                 continue
             
-            # Layout
-            align = random.choice(['left', 'center', 'random'])
+            # Calculate starting X based on alignment
             if align == 'left':
                 x_offset = x_margin + random.randint(0, 20)
             elif align == 'center':
-                x_offset = (img_width - text_width) // 2
+                x_offset = (img_width - total_width) // 2
             else:
-                x_offset = random.randint(x_margin, max(x_margin + 1, img_width - text_width - x_margin))
+                max_x_start = img_width - total_width - x_margin
+                x_offset = random.randint(x_margin, max(x_margin + 1, max_x_start))
             
-            # Boundary checks
-            x_offset = max(10, min(x_offset, img_width - text_width - 10))
-            if y_offset + text_height > img_height - 50:
+            # Ensure fits horizontally
+            x_offset = max(10, min(x_offset, img_width - total_width - 10))
+            
+            # Check vertical space
+            if y_offset + total_height > img_height - 50:
                 break
             
-            # Draw
-            draw.text((x_offset, y_offset), text, font=font, fill=text_color)
+            # Re-measure with actual position
+            min_x, min_y, max_x, max_y, total_width, total_height = \
+                self.measure_line_bbox(draw, line_texts, font, x_offset, y_offset)
             
-            # Calculate bounding box
-            x1 = x_offset
-            y1 = y_offset
-            x2 = x_offset + text_width
-            y2 = y_offset + text_height
+            # Calculate bounding box with padding
+            BBOX_PADDING = 6
+            x1 = max(0, min_x - BBOX_PADDING)
+            y1 = max(0, min_y - BBOX_PADDING)
+            x2 = min(img_width, max_x + BBOX_PADDING)
+            y2 = min(img_height, max_y + BBOX_PADDING)
             
-            # Padding
-            padding = random.randint(2, 8)
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(img_width, x2 + padding)
-            y2 = min(img_height, y2 + padding)
+            temp_bbox = (x1, y1, x2, y2)
             
-            # YOLO format
+            # Check overlap
+            if self.check_overlap(temp_bbox, existing_bboxes, min_spacing=MIN_LINE_SPACING):
+                y_offset += random.randint(MIN_LINE_SPACING, MAX_LINE_SPACING)
+                continue
+            
+            # NOW DRAW THE TEXT - Draw all words in the line
+            current_x = x_offset
+            word_spacing = random.randint(10, 30)
+            
+            for text_part in line_texts:
+                try:
+                    draw.text((current_x, y_offset), text_part, font=font, fill=text_color)
+                    
+                    # Move to next word position
+                    try:
+                        bbox = draw.textbbox((current_x, y_offset), text_part, font=font)
+                        text_width = bbox[2] - bbox[0]
+                    except AttributeError:
+                        text_width, _ = draw.textsize(text_part, font=font)
+                    
+                    current_x += text_width + word_spacing
+                    
+                except Exception:
+                    continue
+            
+            # Store bbox for overlap checking
+            existing_bboxes.append(temp_bbox)
+            
+            # YOLO format - ONE BOX for the entire line
             x_center = ((x1 + x2) / 2) / img_width
             y_center = ((y1 + y2) / 2) / img_height
             width = (x2 - x1) / img_width
             height = (y2 - y1) / img_height
             
-            annotations.append(f"0 {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
-            y_offset += text_height + line_spacing
+            # Ensure valid YOLO coordinates
+            if 0 < x_center < 1 and 0 < y_center < 1 and 0 < width < 1 and 0 < height < 1:
+                annotations.append(f"0 {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
+                successful_lines += 1
+            
+            # Move to next line
+            line_spacing = random.randint(MIN_LINE_SPACING, MAX_LINE_SPACING)
+            y_offset = y2 + line_spacing
         
-        # Augmentation
+        # Apply augmentation
         if augment:
             image = self.apply_augmentation(image)
         
-        # Rotation
-        if augment and random.random() > 0.7:
-            angle = random.uniform(-2, 2)
+        # Optional slight rotation
+        if augment and random.random() > 0.8:
+            angle = random.uniform(-1.5, 1.5)
             image = image.rotate(angle, expand=False, fillcolor=bg_color)
         
-        # Save
-        img_filename = f'khmer_text_{image_idx:05d}.jpg'
+        # Save image
+        img_filename = f'image_{image_idx:05d}.jpg'
         img_path = f'{self.output_dir}/images/{split}/{img_filename}'
         image.save(img_path, quality=random.randint(85, 100))
         
         # Save annotations
-        label_filename = f'khmer_text_{image_idx:05d}.txt'
+        label_filename = f'image_{image_idx:05d}.txt'
         label_path = f'{self.output_dir}/labels/{split}/{label_filename}'
         with open(label_path, 'w') as f:
             f.write('\n'.join(annotations))
@@ -283,16 +378,21 @@ class DetectorDatasetGenerator:
         return len(annotations)
     
     def generate_dataset(self, text_file, font_path=None, num_train=800, num_val=200, 
-                         min_lines=3, max_lines=10, augment=True):
+                         min_lines=3, max_lines=10, min_words_per_line=2, 
+                         max_words_per_line=5, augment=True):
         """Generate complete dataset"""
         print("Loading text file...")
-        texts = self.load_khmer_text(text_file)
-        print(f"Loaded {len(texts)} text lines")
+        texts = self.load_text(text_file)
+        print(f"Loaded {len(texts)} text segments")
         
-        if len(texts) < 10:
-            print("Warning: Not enough text lines. Add more text to your file.")
+        if len(texts) < max_words_per_line:
+            print(f"Warning: Not enough text segments. Need at least {max_words_per_line}")
         
-        print(f"\nSettings: {min_lines}-{max_lines} lines/page, Augment: {augment}, Fonts: {'Random' if not font_path else font_path}")
+        print(f"\nSettings:")
+        print(f"  • Lines per image: {min_lines}-{max_lines}")
+        print(f"  • Words per line: {min_words_per_line}-{max_words_per_line}")
+        print(f"  • Augmentation: {augment}")
+        print(f"  • One bounding box per line (containing all words)")
         
         total_boxes = 0
         
@@ -304,7 +404,9 @@ class DetectorDatasetGenerator:
                 min_lines=min_lines, 
                 max_lines=max_lines, 
                 augment=augment,
-                specific_font_path=font_path
+                specific_font_path=font_path,
+                min_words_per_line=min_words_per_line,
+                max_words_per_line=max_words_per_line
             )
             total_boxes += boxes
         
@@ -315,13 +417,15 @@ class DetectorDatasetGenerator:
                 texts, i, 'val', 
                 min_lines=min_lines, 
                 max_lines=max_lines, 
-                augment=False, 
-                specific_font_path=font_path
+                augment=False,
+                specific_font_path=font_path,
+                min_words_per_line=min_words_per_line,
+                max_words_per_line=max_words_per_line
             )
             total_boxes += boxes
         
-        # Create dataset YAML file
-        yaml_content = f"""# Khmer Text Detection Dataset
+        # Create dataset YAML
+        yaml_content = f"""# Khmer Text Line Detection Dataset (Multi-word per line)
 path: {os.path.abspath(self.output_dir)}
 train: images/train
 val: images/val
@@ -336,16 +440,19 @@ names: ['text']
         
         print(f"\n✓ Dataset generation complete!")
         print(f"✓ Total images: {num_train + num_val}")
-        print(f"✓ Total text boxes: {total_boxes}")
-        print(f"✓ Dataset config saved to: {yaml_path}")
-        print(f"\nNext steps:")
-        print(f"1. Review generated images in: {self.output_dir}/images/")
-        print(f"2. Train YOLO model with: kiri-ocr train-detector")
+        print(f"✓ Total line boxes: {total_boxes}")
+        print(f"✓ Avg lines per image: {total_boxes/(num_train+num_val):.1f}")
+        print(f"✓ Dataset config: {yaml_path}")
+        print(f"\nOptimizations applied:")
+        print(f"  • {min_words_per_line}-{max_words_per_line} words per line")
+        print(f"  • ONE bounding box per line (all words inside)")
+        print(f"  • Non-overlapping lines with 40-60px spacing")
+        print(f"  • Fixed 6px padding around each line box")
+        print(f"  • Words properly spaced within each line")
+        print(f"\nNext: Train with 'kiri-ocr train-detector'")
 
 def generate_detector_dataset_command(args):
-    """
-    CLI Command handler for detector dataset generation
-    """
+    """CLI Command handler"""
     generator = DetectorDatasetGenerator(
         output_dir=args.output,
         fonts_dir=args.fonts_dir
@@ -357,15 +464,18 @@ def generate_detector_dataset_command(args):
         print(f"Error: Text file '{TEXT_FILE}' not found!")
         print("Creating sample text file...")
         sample_texts = [
-            "ជំរាបសួរ",
-            "សូមអរគុណ",
-            "អ្នកមានសុខភាពល្អទេ",
-            "ខ្ញុំសុខសប្បាយ",
-            "តើអ្នកទៅណា",
+            "ជំរាបសួរ", "សូមអរគុណ", "អ្នកមានសុខភាពល្អទេ",
+            "ខ្ញុំសុខសប្បាយ", "តើអ្នកទៅណា", "យើងជួបគ្នាម្តងទៀត",
+            "សូមអត់ទោស", "ខ្ញុំមិនយល់ទេ", "តើអ្នកនិយាយភាសាអង់គ្លេសបានទេ",
+            "សូមជួយខ្ញុំផង", "ធ្វើដំណើរប្រុងប្រយ័ត្ន", "ជាទីស្រលាញ់",
         ]
         with open(TEXT_FILE, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(sample_texts * 20))
+            f.write('\n'.join(sample_texts * 10))
         print(f"Created sample file: {TEXT_FILE}")
+    
+    # Get words per line params if available
+    min_words = getattr(args, 'min_words_per_line', 2)
+    max_words = getattr(args, 'max_words_per_line', 5)
     
     generator.generate_dataset(
         text_file=TEXT_FILE,
@@ -374,5 +484,7 @@ def generate_detector_dataset_command(args):
         num_val=args.num_val,
         min_lines=args.min_lines,
         max_lines=args.max_lines,
+        min_words_per_line=min_words,
+        max_words_per_line=max_words,
         augment=not args.no_augment
     )
