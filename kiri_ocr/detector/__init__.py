@@ -11,38 +11,41 @@ from .legacy import (
     DetectionLevel
 )
 
-# Import YOLO detector
+# Import CRAFT detector
 try:
-    from .yolo import YOLOTextDetector
+    from .craft import CRAFTDetector
 except ImportError:
-    YOLOTextDetector = None
+    CRAFTDetector = None
+
+# Legacy YOLO support (removed)
+YOLOTextDetector = None
 
 class TextDetector:
     """
-    Unified Text Detector that supports both YOLO-based and classic computer vision approaches.
-    Defaults to YOLO if available, otherwise falls back to classic.
+    Unified Text Detector that supports both CRAFT-based and classic computer vision approaches.
+    Defaults to CRAFT if available, otherwise falls back to classic.
     """
     
-    def __init__(self, method: str = 'yolo', model_path: Optional[str] = None, **kwargs):
+    def __init__(self, method: str = 'craft', model_path: Optional[str] = None, **kwargs):
         """
         Initialize the TextDetector.
         
         Args:
-            method: 'yolo' or 'legacy' (classic CV)
-            model_path: Path to YOLO model (optional)
+            method: 'craft' or 'legacy' (classic CV)
+            model_path: Path to CRAFT model (optional)
             **kwargs: Arguments passed to ImageProcessingTextDetector
         """
         self.conf_threshold = kwargs.pop('conf_threshold', 0.25)
         self.method = method
         self.kwargs = kwargs
-        self.yolo_detector = None
+        self.craft_detector = None
         
         # Try to resolve model path if not provided
         if model_path is None:
              possible_paths = [
-                 'runs/detect/khmer_text_detector/weights/best.pt',
-                 'best.pt',  # Check current directory
-                 os.path.join(os.path.dirname(__file__), 'best.pt'), # Check package directory
+                 'runs/detect/khmer_text_detector/weights/best.pth',
+                 'best.pth',  # Check current directory
+                 os.path.join(os.path.dirname(__file__), 'best.pth'), # Check package directory
              ]
              for p in possible_paths:
                  if os.path.exists(p):
@@ -51,55 +54,63 @@ class TextDetector:
         
         self.model_path = model_path
         
-        # Initialize YOLO if requested
-        if self.method == 'yolo':
-             if YOLOTextDetector is None:
-                 warnings.warn("YOLO detector not available (ultralytics not installed?). Falling back to legacy.")
+        # Initialize CRAFT if requested
+        if self.method == 'craft':
+             if CRAFTDetector is None:
+                 warnings.warn("CRAFT detector not available. Falling back to legacy.")
                  self.method = 'legacy'
-             elif self.model_path and os.path.exists(self.model_path):
-                 try:
-                     self.yolo_detector = YOLOTextDetector(self.model_path)
-                     # print(f"Loaded YOLO detector from {self.model_path}")
-                 except Exception as e:
-                     print(f"Error loading YOLO detector: {e}. Falling back to legacy.")
-                     self.method = 'legacy'
              else:
-                 # Silently fallback if model not found, as user might not have trained it yet
-                 # warnings.warn(f"YOLO model not found at {self.model_path}. Using legacy detector.")
-                 self.method = 'legacy'
+                 try:
+                     self.craft_detector = CRAFTDetector()
+                     # Load weights if path exists (TODO: implement load_weights in CRAFTDetector)
+                     # if self.model_path and os.path.exists(self.model_path):
+                     #     self.craft_detector.load_weights(self.model_path)
+                 except Exception as e:
+                     print(f"Error loading CRAFT detector: {e}. Falling back to legacy.")
+                     self.method = 'legacy'
         
         # Always initialize legacy detector as fallback/helper
         self.legacy_detector = ImageProcessingTextDetector(**kwargs)
 
     def detect_lines(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[int, int, int, int]]:
         """Detect text lines."""
-        if self.method == 'yolo' and self.yolo_detector:
+        if self.method == 'craft' and self.craft_detector:
             try:
-                detections = self.yolo_detector.detect_image(image, conf_threshold=self.conf_threshold, show_labels=False)
+                # CRAFT returns list of boxes (x1, y1, x2, y2)
+                # We need to handle str/Path vs ndarray for detect_text
+                if isinstance(image, (str, Path)):
+                    img_path = str(image)
+                    detected_boxes = self.craft_detector.detect_text(img_path)
+                else:
+                    # TODO: Support direct numpy array in CRAFTDetector.detect_text
+                    # For now, fallback or temporary save
+                    warnings.warn("CRAFT detector currently requires file path. Falling back to legacy.")
+                    return self.legacy_detector.detect_lines(image)
+
                 boxes = []
                 padding = self.kwargs.get('padding', 0)
                 
-                for d in detections:
-                    x, y, x2, y2 = d['bbox']
-                    conf = d['confidence']
-                    w = x2 - x
-                    h = y2 - y
+                for box in detected_boxes:
+                    x1, y1, x2, y2 = box
+                    w = x2 - x1
+                    h = y2 - y1
                     
                     # Apply padding
                     if padding:
-                         x = max(0, x - padding)
-                         y = max(0, y - padding)
+                         x1 = max(0, x1 - padding)
+                         y1 = max(0, y1 - padding)
                          w += 2 * padding
                          h += 2 * padding
                     
-                    boxes.append(TextBox(x, y, w, h, confidence=conf, level=DetectionLevel.LINE))
+                    # Confidence is not returned by simple detect_text, assume 1.0 or extract if possible
+                    boxes.append(TextBox(x1, y1, w, h, confidence=1.0, level=DetectionLevel.LINE))
                 
                 boxes = sorted(boxes, key=lambda b: b.y)
                 boxes = self._merge_overlapping_boxes(boxes)
                 return [b.bbox for b in boxes]
                 
             except Exception as e:
-                print(f"YOLO detection failed: {e}. Falling back to legacy.")
+                print(f"CRAFT detection failed: {e}. Falling back to legacy.")
                 return self.legacy_detector.detect_lines(image)
         
         return self.legacy_detector.detect_lines(image)
@@ -112,19 +123,19 @@ class TextDetector:
         
     def detect_blocks(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[int, int, int, int]]:
         """Detect text blocks."""
-        if self.method == 'yolo' and self.yolo_detector:
-             # Get lines using YOLO
+        if self.method == 'craft' and self.craft_detector:
+             # Get lines using CRAFT
              lines_bbox = self.detect_lines(image)
              
              # Convert back to TextBox for grouping
              lines = [
-                 TextBox(x, y, w, h, level=DetectionLevel.LINE) 
+                 TextBox(x, y, w, h, level=DetectionLevel.LINE)
                  for (x, y, w, h) in lines_bbox
              ]
              
              # We need image dimensions for grouping
              img = self.legacy_detector._load_image(image)
-             if img is None: 
+             if img is None:
                  return []
              h, w = img.shape[:2]
              

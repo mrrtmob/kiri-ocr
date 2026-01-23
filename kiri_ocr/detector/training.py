@@ -1,195 +1,200 @@
-from ultralytics import YOLO
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
 import os
-import argparse
+import json
+from PIL import Image
+import time
+import cv2
+from tqdm import tqdm
 
-class DetectorTrainer:
-    def __init__(self, data_yaml='detector_dataset/data.yaml'):
-        self.data_yaml = data_yaml
-        self.check_setup()
-    
-    def check_setup(self):
-        """Check if dataset and dependencies are ready"""
-        print("=== Checking Setup ===")
+from .craft import CRAFT
+
+# === Dataset ===
+
+class CRAFTDataset(Dataset):
+    def __init__(self, data_dir, image_size=512):
+        self.data_dir = data_dir
+        self.image_size = image_size
         
-        # Check CUDA
-        if torch.cuda.is_available():
-            print(f"✓ GPU available: {torch.cuda.get_device_name(0)}")
-            self.device = 0
+        info_path = os.path.join(data_dir, 'dataset_info.json')
+        if not os.path.exists(info_path):
+            raise FileNotFoundError(f"Dataset info not found at {info_path}")
+            
+        with open(info_path, 'r') as f:
+            self.info = json.load(f)
+            
+        # Try loading samples from separate list file (new format)
+        list_path = os.path.join(data_dir, 'annotations_list.json')
+        if os.path.exists(list_path):
+            with open(list_path, 'r') as f:
+                self.samples = json.load(f)
+        elif 'samples' in self.info:
+            self.samples = self.info['samples']
         else:
-            print("⚠ No GPU found, training will use CPU (slower)")
-            self.device = 'cpu'
-        
-        # Check dataset
-        if os.path.exists(self.data_yaml):
-            print(f"✓ Dataset config found: {self.data_yaml}")
-        else:
-            print(f"✗ Dataset config not found: {self.data_yaml}")
-            print("Please run the dataset generator first!")
-            # We don't exit here to allow library usage to handle error, but for CLI it will fail later or here
-            
-        
-        # Check if images exist
-        dataset_dir = os.path.dirname(self.data_yaml)
-        train_imgs = f"{dataset_dir}/images/train"
-        val_imgs = f"{dataset_dir}/images/val"
-        
-        if os.path.exists(train_imgs):
-            num_train = len([f for f in os.listdir(train_imgs) if f.endswith(('.jpg', '.png'))])
-            print(f"✓ Training images: {num_train}")
-        else:
-            print(f"✗ Training images not found in {train_imgs}")
-        
-        if os.path.exists(val_imgs):
-            num_val = len([f for f in os.listdir(val_imgs) if f.endswith(('.jpg', '.png'))])
-            print(f"✓ Validation images: {num_val}")
-        else:
-            print(f"✗ Validation images not found in {val_imgs}")
-        
-        print("✓ Setup check complete!\n")
+            print(f"Error: 'samples' key missing in {info_path} and {list_path} not found.")
+            print("It seems you are using an incompatible dataset format.")
+            print("Please re-generate the dataset using the new generator:")
+            print("  python -m kiri_ocr.cli generate-detector --text-file ... --num-train ...")
+            raise ValueError("Incompatible dataset format. Please regenerate dataset.")
+        print(f"Loaded {len(self.samples)} samples from {data_dir}")
     
-    def train_model(self, 
-                   model_size='n',      # 'n', 's', 'm', 'l', 'x'
-                   epochs=100,
-                   batch_size=16,
-                   image_size=640,
-                   name='khmer_text_detector'):
-        """Train YOLO model on Khmer text dataset"""
-        
-        print("=== Starting Training ===")
-        print(f"Model: YOLOv8{model_size}")
-        print(f"Epochs: {epochs}")
-        print(f"Batch size: {batch_size}")
-        print(f"Image size: {image_size}")
-        print(f"Device: {self.device}")
-        print()
-        
-        # Load pretrained model
-        model_path = f'yolov8{model_size}.pt'
-        print(f"Loading pretrained model: {model_path}")
-        model = YOLO(model_path)
-        
-        # Train the model
-        results = model.train(
-            data=self.data_yaml,
-            epochs=epochs,
-            imgsz=image_size,
-            batch=batch_size,
-            name=name,
-            device=self.device,
-            
-            # Training parameters
-            patience=20,              # Early stopping patience
-            save=True,                # Save checkpoints
-            save_period=10,           # Save every N epochs
-            cache=False,              # Cache images for faster training (use True if you have RAM)
-            
-            # Optimization
-            optimizer='Adam',         # Adam optimizer
-            lr0=0.01,                 # Initial learning rate
-            lrf=0.01,                 # Final learning rate
-            momentum=0.937,           # SGD momentum
-            weight_decay=0.0005,      # Optimizer weight decay
-            
-            # Augmentation
-            augment=True,             # Use data augmentation
-            mosaic=1.0,               # Mosaic augmentation probability
-            mixup=0.0,                # Mixup augmentation probability
-            copy_paste=0.0,           # Copy-paste augmentation
-            degrees=10.0,             # Rotation degrees
-            translate=0.1,            # Translation
-            scale=0.5,                # Scale
-            shear=0.0,                # Shear
-            perspective=0.0,          # Perspective
-            flipud=0.0,               # Flip up-down
-            fliplr=0.5,               # Flip left-right
-            hsv_h=0.015,              # HSV-Hue augmentation
-            hsv_s=0.7,                # HSV-Saturation
-            hsv_v=0.4,                # HSV-Value
-            
-            # Other settings
-            verbose=True,             # Verbose output
-            seed=42,                  # Random seed
-            deterministic=True,       # Deterministic training
-            single_cls=True,          # Single class dataset
-            rect=False,               # Rectangular training
-            cos_lr=False,             # Cosine learning rate scheduler
-            close_mosaic=10,          # Disable mosaic last N epochs
-            amp=True,                 # Automatic Mixed Precision
-            fraction=1.0,             # Dataset fraction to use
-            profile=False,            # Profile ONNX and TensorRT speeds
-            
-            # Validation
-            val=True,                 # Validate during training
-            plots=True,               # Save plots
-            
-            # Project organization
-            project='runs/detect',
-            exist_ok=True,
-        )
-        
-        print("\n=== Training Complete! ===")
-        print(f"Best model saved to: runs/detect/{name}/weights/best.pt")
-        print(f"Last model saved to: runs/detect/{name}/weights/last.pt")
-        print(f"Results saved to: runs/detect/{name}/")
-        
-        return results
+    def __len__(self):
+        return len(self.samples)
     
-    def resume_training(self, checkpoint_path, epochs=50):
-        """Resume training from a checkpoint"""
-        print(f"Resuming training from: {checkpoint_path}")
-        model = YOLO(checkpoint_path)
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
         
-        results = model.train(
-            resume=True,
-            epochs=epochs
-        )
+        # Load image
+        img_path = os.path.join(self.data_dir, 'images', sample['image'])
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            # Create dummy
+            image = Image.new('RGB', (self.image_size, 64))
         
-        return results
-    
-    def evaluate_model(self, model_path):
-        """Evaluate trained model"""
-        print(f"\n=== Evaluating Model ===")
-        model = YOLO(model_path)
+        image = np.array(image).astype(np.float32) / 255.0
         
-        # Validate on validation set
-        metrics = model.val(data=self.data_yaml)
+        # Normalize (ImageNet mean/std)
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        image = (image - mean) / std
         
-        print(f"\nMetrics:")
-        print(f"mAP50: {metrics.box.map50:.4f}")
-        print(f"mAP50-95: {metrics.box.map:.4f}")
-        print(f"Precision: {metrics.box.mp:.4f}")
-        print(f"Recall: {metrics.box.mr:.4f}")
+        image = image.transpose(2, 0, 1) # CHW
         
-        return metrics
+        # Load maps
+        region_path = os.path.join(self.data_dir, 'labels', sample['region_map'])
+        affinity_path = os.path.join(self.data_dir, 'labels', sample['affinity_map'])
+        
+        try:
+            region = np.load(region_path)
+            affinity = np.load(affinity_path)
+            
+            # Resize maps to 1/2 size (CRAFT output size)
+            h, w = region.shape
+            region = cv2.resize(region, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST)
+            affinity = cv2.resize(affinity, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST)
+            
+        except:
+             h, w = image.shape[1] // 2, image.shape[2] // 2
+             region = np.zeros((h, w), dtype=np.float32)
+             affinity = np.zeros((h, w), dtype=np.float32)
+
+        # Expand dims for channel
+        region = np.expand_dims(region, 0)
+        affinity = np.expand_dims(affinity, 0)
+        
+        return torch.FloatTensor(image), torch.FloatTensor(region), torch.FloatTensor(affinity)
+
+# === Trainer ===
+
+class CRAFTTrainer:
+    def __init__(self, data_dir, output_dir='runs/detect/khmer_text_detector'):
+        self.data_dir = data_dir
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'weights'), exist_ok=True)
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        self.model = CRAFT(pretrained=True).to(self.device)
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4, weight_decay=1e-5)
+        
+    def train(self, epochs=100, batch_size=8, num_workers=2):
+        dataset = CRAFTDataset(self.data_dir)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        
+        print(f"Starting training for {epochs} epochs...")
+        
+        best_loss = float('inf')
+        
+        for epoch in range(epochs):
+            self.model.train()
+            epoch_loss = 0
+            
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+            for images, regions, affinities in pbar:
+                images = images.to(self.device)
+                regions = regions.to(self.device)
+                affinities = affinities.to(self.device)
+                
+                # Forward
+                y, feature = self.model(images)
+                # y is [B, H/2, W/2, 2] (channels last)
+                
+                # Permute to [B, 2, H/2, W/2]
+                y = y.permute(0, 3, 1, 2)
+                
+                pred_region = y[:, 0:1, :, :]
+                pred_affinity = y[:, 1:2, :, :]
+                
+                # Loss
+                loss_region = self.criterion(torch.sigmoid(pred_region), regions)
+                loss_affinity = self.criterion(torch.sigmoid(pred_affinity), affinities)
+                loss = loss_region + loss_affinity
+                
+                # Backward
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                
+                epoch_loss += loss.item()
+                pbar.set_postfix({'loss': loss.item()})
+            
+            avg_loss = epoch_loss / len(dataloader)
+            print(f"Epoch {epoch+1} Average Loss: {avg_loss:.6f}")
+            
+            # Save checkpoint
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                save_path = os.path.join(self.output_dir, 'weights', 'best.pth')
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': best_loss,
+                }, save_path)
+                print(f"Saved best model to {save_path}")
+                
+            # Save last
+            save_path = os.path.join(self.output_dir, 'weights', 'last.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'loss': avg_loss,
+            }, save_path)
 
 def train_detector_command(args):
-    """
-    CLI Command handler for detector training
-    """
-    # Initialize trainer
-    if not os.path.exists(args.data_yaml):
-         print(f"Error: Data config '{args.data_yaml}' not found. Please run generate-detector-dataset first.")
-         exit(1)
-
-    trainer = DetectorTrainer(data_yaml=args.data_yaml)
+    """CLI Command handler"""
+    # Args from cli.py: data_yaml (unused now), model_size, epochs, batch_size, etc.
+    # We'll use --data-yaml to point to dataset directory (dataset_info.json is inside)
+    # The default in CLI is detector_dataset/data.yaml. We can strip 'data.yaml'.
     
-    # Train model
-    results = trainer.train_model(
-        model_size=args.model_size,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
-        name=args.name
+    data_path = args.data_yaml
+    if data_path.endswith('data.yaml'):
+        data_path = os.path.dirname(data_path)
+    
+    if not os.path.exists(data_path):
+        # Fallback to detector_dataset
+        if os.path.exists('detector_dataset'):
+            data_path = 'detector_dataset'
+        else:
+            print(f"Error: Dataset not found at {data_path}")
+            return
+
+    trainer = CRAFTTrainer(
+        data_dir=data_path,
+        output_dir=f'runs/detect/{args.name}'
     )
     
-    # Evaluate the best model
-    best_model_path = f'runs/detect/{args.name}/weights/best.pt'
-    if os.path.exists(best_model_path):
-        trainer.evaluate_model(best_model_path)
-    
-    print("\n=== Training Summary ===")
-    print("To use your model for detection:")
-    print(f"  model = YOLO('{best_model_path}')")
-    print("\nTo view training results:")
-    print(f"  Check: runs/detect/{args.name}/")
+    trainer.train(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        num_workers=args.workers if hasattr(args, 'workers') else 1
+    )

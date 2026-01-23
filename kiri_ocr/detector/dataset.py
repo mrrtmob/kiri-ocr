@@ -1,534 +1,479 @@
-import os
-import random
-from PIL import Image, ImageDraw, ImageFont
+"""
+Multilingual Dataset Generator for Text Detection (CRAFT-style)
+Supports Khmer, English, and other languages
+"""
 import numpy as np
-import cv2
-import argparse
-from tqdm import tqdm
-import concurrent.futures
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+import os
+import json
+import random
+from typing import Union, Dict, List, Tuple
+from pathlib import Path
 
-try:
-    from ..generator import FontManager
-except ImportError:
-    try:
-        from kiri_ocr.generator import FontManager
-    except ImportError:
-        FontManager = None
-
-# Global worker instance for multiprocessing
-_worker_instance = None
-
-def _init_worker(output_dir, fonts_dir):
-    global _worker_instance
-    _worker_instance = DetectorDatasetGenerator(output_dir, fonts_dir)
-
-def _process_wrapper(args):
-    texts, image_idx, split, kwargs = args
-    return _worker_instance.generate_single_image(texts, image_idx, split, **kwargs)
-
-class DetectorDatasetGenerator:
-    def __init__(self, output_dir='detector_dataset', fonts_dir='fonts'):
-        self.output_dir = output_dir
-        self.fonts_dir = fonts_dir
-        self.font_manager = None
-        if FontManager:
-            self.font_manager = FontManager(fonts_dir=fonts_dir)
-        
-        self.setup_directories()
-        
-    def setup_directories(self):
-        """Create dataset directory structure"""
-        dirs = [
-            f'{self.output_dir}/images/train',
-            f'{self.output_dir}/images/val',
-            f'{self.output_dir}/labels/train',
-            f'{self.output_dir}/labels/val'
-        ]
-        for d in dirs:
-            os.makedirs(d, exist_ok=True)
+class MultilingualDatasetGenerator:
+    """Dataset generator supporting multiple languages (Khmer, English, etc.)"""
     
-    def load_text(self, text_file):
-        """Load Khmer text from file"""
-        with open(text_file, 'r', encoding='utf-8') as f:
-            lines = [line.strip() for line in f.readlines() if line.strip()]
+    def __init__(self, output_dir='dataset', image_width=512, image_height=64):
+        self.output_dir = output_dir
+        self.image_width = image_width
+        self.image_height = image_height
+        
+        # Create output directories
+        os.makedirs(os.path.join(output_dir, 'images'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'labels'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'annotations'), exist_ok=True)
+        
+    def load_text_lines(self, text_file: Union[str, List[str]]) -> List[str]:
+        """Load text lines from file(s)"""
+        if isinstance(text_file, str):
+            text_file = [text_file]
+        
+        lines = []
+        for file in text_file:
+            if not os.path.exists(file):
+                print(f"Warning: Text file '{file}' not found, skipping...")
+                continue
+            with open(file, 'r', encoding='utf-8') as f:
+                file_lines = [line.strip() for line in f.readlines() if line.strip()]
+                lines.extend(file_lines)
+                print(f"  Loaded {len(file_lines)} lines from {file}")
         return lines
     
-    def get_random_background_color(self):
-        """Generate random background color"""
-        colors = [
-            (255, 255, 255),  # White
-            (240, 240, 240),  # Light gray
-            (255, 250, 240),  # Floral white
-            (245, 245, 220),  # Beige
-            (230, 230, 250),  # Lavender
-            (250, 250, 250),  # Very light gray
-            (255, 255, 240),  # Ivory
-        ]
-        return random.choice(colors)
+    def get_font_list(self, font_dir: str) -> List[str]:
+        """Get list of font files"""
+        font_files = []
+        if not os.path.isdir(font_dir):
+            print(f"Warning: Font directory '{font_dir}' not found")
+            return font_files
+            
+        for file in os.listdir(font_dir):
+            if file.endswith(('.ttf', '.otf', '.TTF', '.OTF')):
+                font_files.append(os.path.join(font_dir, file))
+        return font_files
     
-    def get_random_text_color(self):
-        """Generate random text color"""
-        colors = [
-            (0, 0, 0),        # Black
-            (50, 50, 50),     # Dark gray
-            (0, 0, 139),      # Dark blue
-            (139, 0, 0),      # Dark red
-            (0, 100, 0),      # Dark green
-            (30, 30, 30),     # Almost black
-        ]
-        return random.choice(colors)
-    
-    def _is_text_supported(self, font, text):
-        """Check if font supports the characters in text"""
-        try:
-            undefined_chars = ['\uFFFF', '\U0010FFFF', '\0']
-            ref_mask = None
-            ref_bbox = None
-            
-            for uc in undefined_chars:
-                try:
-                    ref_mask = font.getmask(uc)
-                    ref_bbox = ref_mask.getbbox()
-                    if ref_mask:
-                        break
-                except Exception:
-                    continue
-            
-            if ref_mask is None:
-                return True
-
-            ref_bytes = bytes(ref_mask)
-
-            for char in text:
-                if char.isspace() or ord(char) < 32:
-                    continue
-                    
-                try:
-                    char_mask = font.getmask(char)
-                    char_bbox = char_mask.getbbox()
-                    
-                    if char_bbox == ref_bbox:
-                        if bytes(char_mask) == ref_bytes:
-                            return False
-                except Exception:
-                    return False
-                    
-            return True
-        except Exception:
-            return True
-    
-    def apply_augmentation(self, image):
-        """Apply random augmentations to the full page image"""
-        img_array = np.array(image)
-        
-        # Gaussian Noise
-        if random.random() > 0.5:
-            noise = np.random.normal(0, random.randint(5, 20), img_array.shape)
-            img_array = np.clip(img_array + noise, 0, 255).astype(np.uint8)
-            
-        # Blur
-        if random.random() > 0.6:
-            ksize = random.choice([3, 5])
-            img_array = cv2.GaussianBlur(img_array, (ksize, ksize), 0)
-            
-        # Brightness/Contrast
-        if random.random() > 0.5:
-            alpha = random.uniform(0.8, 1.2)
-            beta = random.randint(-30, 30)
-            img_array = cv2.convertScaleAbs(img_array, alpha=alpha, beta=beta)
-            
-        # JPEG Compression
-        if random.random() > 0.5:
-            quality = random.randint(50, 95)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-            result, encimg = cv2.imencode('.jpg', img_array, encode_param)
-            img_array = cv2.imdecode(encimg, 1)
-
-        return Image.fromarray(img_array)
-    
-    def measure_line_bbox(self, draw, line_parts, font, start_x, start_y):
-        """Measure the complete bounding box for a line with multiple text parts"""
+    def generate_character_boxes(self, draw: ImageDraw, text: str, 
+                                font: ImageFont, start_x: int, start_y: int) -> List[Dict]:
+        """Generate character-level bounding boxes"""
+        boxes = []
         current_x = start_x
-        min_x = start_x
-        max_x = start_x
-        min_y = start_y
-        max_y = start_y
         
-        for text_part in line_parts:
-            try:
+        for char in text:
+            if char.isspace():  # Skip spaces but advance position
                 try:
-                    bbox = draw.textbbox((current_x, start_y), text_part, font=font)
-                    text_width = bbox[2] - bbox[0]
-                    text_height = bbox[3] - bbox[1]
-                    
-                    min_x = min(min_x, bbox[0])
-                    max_x = max(max_x, bbox[2])
-                    min_y = min(min_y, bbox[1])
-                    max_y = max(max_y, bbox[3])
-                    
-                except AttributeError:
-                    text_width, text_height = draw.textsize(text_part, font=font)
-                    max_x = current_x + text_width
-                    max_y = start_y + text_height
-                
-                current_x += text_width + random.randint(10, 30)
-                
-            except Exception:
-                continue
-        
-        total_width = max_x - min_x
-        total_height = max_y - min_y
-        
-        return min_x, min_y, max_x, max_y, total_width, total_height
-    
-    def generate_single_image(self, texts, image_idx, split='train', 
-                              min_lines=5, max_lines=15, augment=True, 
-                              specific_font_path=None,
-                              min_words_per_line=2, max_words_per_line=5):
-        """Generate realistic document-style layout with paragraphs and tight line spacing"""
-        
-        # Image dimensions (Standard A4-ish ratio)
-        # A4 is 210x297mm (1:1.414)
-        base_width = random.randint(900, 1200)
-        img_width = base_width
-        img_height = int(base_width * random.uniform(1.3, 1.5))
-        
-        # Create image
-        bg_color = self.get_random_background_color()
-        image = Image.new('RGB', (img_width, img_height), bg_color)
-        draw = ImageDraw.Draw(image)
-        
-        # Determine number of lines
-        num_lines = random.randint(min_lines, max_lines)
-        
-        # Annotations
-        annotations = []
-        
-        # Document-style layout
-        y_offset = random.randint(60, 120)
-        x_margin = random.randint(60, 120)
-        
-        # REALISTIC DOCUMENT SPACING
-        # Within paragraph: tight spacing (like line-height: 1.2-1.5)
-        # Between paragraphs: larger spacing
-        
-        # Common text color and font for document consistency
-        text_color = self.get_random_text_color()
-        
-        # Font paths
-        available_font_paths = []
-        if self.font_manager and self.font_manager.all_fonts:
-            available_font_paths = list(set([f[0] for f in self.font_manager.all_fonts]))
-        
-        # Select ONE font size for the entire document (realistic)
-        document_font_size = random.randint(28, 42) # Slightly smaller for more text density
-        
-        successful_lines = 0
-        current_paragraph_lines = 0
-        paragraph_size = random.randint(4, 10)  # Larger paragraphs
-        
-        while successful_lines < num_lines and y_offset < img_height - 100:
-            # Determine if heading (start of page or random new section)
-            is_heading = False
-            if successful_lines == 0 or (current_paragraph_lines == 0 and random.random() < 0.15):
-                is_heading = True
-
-            # Create line with multiple words
-            if is_heading:
-                 # Headings are shorter
-                 num_words = random.randint(1, 3)
-            else:
-                 num_words = random.randint(min_words_per_line, max_words_per_line)
-            
-            line_texts = random.sample(texts, min(num_words, len(texts)))
-            
-            # Font size
-            font_size = int(document_font_size * 1.5) if is_heading else document_font_size
-            font = None
-            
-            # Try specific font
-            if specific_font_path:
-                try:
-                    candidate = ImageFont.truetype(specific_font_path, font_size)
-                    all_supported = all(self._is_text_supported(candidate, t) for t in line_texts)
-                    if all_supported:
-                        font = candidate
+                    char_width = draw.textbbox((current_x, start_y), char, font=font)[2] - current_x
+                    current_x += char_width
                 except:
-                    pass
-            
-            # Random font selection
-            if font is None and available_font_paths:
-                retries = 10
-                for _ in range(retries):
-                    random_path = random.choice(available_font_paths)
-                    try:
-                        candidate = ImageFont.truetype(random_path, font_size)
-                        all_supported = all(self._is_text_supported(candidate, t) for t in line_texts)
-                        if all_supported:
-                            font = candidate
-                            break
-                    except:
-                        continue
-            
-            if font is None:
-                font = ImageFont.load_default()
-            
-            # Document-style alignment
-            if is_heading:
-                 align_choice = random.choice(['left', 'center'])
-            else:
-                 align_choice = random.choices(['left', 'justified', 'center'], weights=[80, 15, 5])[0]
-            
-            # Pre-measure the line
-            temp_x = x_margin
-            min_x, min_y, max_x, max_y, total_width, total_height = \
-                self.measure_line_bbox(draw, line_texts, font, temp_x, y_offset)
-            
-            # Skip if too small or too wide
-            if total_height < 20 or total_width > img_width - 2 * x_margin:
+                    current_x += 5  # Default space width
+                continue
+                
+            # Get bounding box for character
+            try:
+                bbox = draw.textbbox((current_x, start_y), char, font=font)
+            except:
                 continue
             
-            # Calculate X position
-            if align_choice == 'left' or align_choice == 'justified':
-                x_offset = x_margin + random.randint(0, 10)
-            elif align_choice == 'center':
-                x_offset = (img_width - total_width) // 2
-            else:
-                max_x_start = img_width - total_width - x_margin
-                x_offset = random.randint(x_margin, max(x_margin + 1, max_x_start))
-            
-            x_offset = max(10, min(x_offset, img_width - total_width - 10))
-            
-            # Check vertical space
-            if y_offset + total_height > img_height - 60:
-                break
-            
-            # Re-measure with actual position
-            min_x, min_y, max_x, max_y, total_width, total_height = \
-                self.measure_line_bbox(draw, line_texts, font, x_offset, y_offset)
-            
-            # Draw all words in the line
-            current_x = x_offset
-            word_spacing = random.randint(12, 25)
-            
-            for text_part in line_texts:
-                try:
-                    draw.text((current_x, y_offset), text_part, font=font, fill=text_color)
-                    
-                    try:
-                        bbox = draw.textbbox((current_x, y_offset), text_part, font=font)
-                        text_width = bbox[2] - bbox[0]
-                    except AttributeError:
-                        text_width, _ = draw.textsize(text_part, font=font)
-                    
-                    current_x += text_width + word_spacing
-                    
-                except Exception:
-                    continue
-            
-            # Create bounding box with minimal padding (document-style)
-            BBOX_PADDING = 4  # Tighter padding for document look
-            x1 = max(0, min_x - BBOX_PADDING)
-            y1 = max(0, min_y - BBOX_PADDING)
-            x2 = min(img_width, max_x + BBOX_PADDING)
-            y2 = min(img_height, max_y + BBOX_PADDING)
-            
-            # YOLO format
-            x_center = ((x1 + x2) / 2) / img_width
-            y_center = ((y1 + y2) / 2) / img_height
-            width = (x2 - x1) / img_width
-            height = (y2 - y1) / img_height
-            
-            if 0 < x_center < 1 and 0 < y_center < 1 and 0 < width < 1 and 0 < height < 1:
-                annotations.append(f"0 {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
-                successful_lines += 1
-                current_paragraph_lines += 1
-            
-            # REALISTIC DOCUMENT LINE SPACING
-            if is_heading:
-                 # Large space after heading
-                 y_offset = y2 + random.randint(20, 40)
-                 current_paragraph_lines = 0 # Headings start new section
-                 paragraph_size = random.randint(4, 10)
-            else:
-                # Check if we should start a new paragraph
-                if current_paragraph_lines >= paragraph_size:
-                    # Paragraph break: add extra spacing
-                    paragraph_spacing = random.randint(15, 25)
-                    y_offset = y2 + paragraph_spacing
-                    
-                    # Reset paragraph tracking
-                    current_paragraph_lines = 0
-                    paragraph_size = random.randint(4, 10)
-                else:
-                    # Within paragraph: tight spacing (realistic document)
-                    within_para_spacing = random.randint(5, 12)
-                    y_offset = y2 + within_para_spacing
+            if bbox[2] > bbox[0] and bbox[3] > bbox[1]:  # Valid box
+                boxes.append({
+                    'char': char,
+                    'bbox': [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+                    'center': [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
+                })
+                
+                # Move to next character position
+                char_width = bbox[2] - bbox[0]
+                current_x += char_width
         
-        # Apply augmentation
-        if augment:
-            image = self.apply_augmentation(image)
-        
-        # Minimal rotation for document scan effect
-        if augment and random.random() > 0.85:
-            angle = random.uniform(-0.8, 0.8)  # Very slight rotation
-            image = image.rotate(angle, expand=False, fillcolor=bg_color)
-        
-        # Save
-        img_filename = f'image_{image_idx:05d}.jpg'
-        img_path = f'{self.output_dir}/images/{split}/{img_filename}'
-        image.save(img_path, quality=random.randint(85, 100))
-        
-        label_filename = f'image_{image_idx:05d}.txt'
-        label_path = f'{self.output_dir}/labels/{split}/{label_filename}'
-        with open(label_path, 'w') as f:
-            f.write('\n'.join(annotations))
-        
-        return len(annotations)
+        return boxes
     
-    def generate_dataset(self, text_file, font_path=None, num_train=800, num_val=200,
-                         min_lines=5, max_lines=15, min_words_per_line=2,
-                         max_words_per_line=5, augment=True, workers=1):
-        """Generate complete dataset with realistic document formatting"""
-        print("Loading text file...")
-        texts = self.load_text(text_file)
-        print(f"Loaded {len(texts)} text segments")
+    def generate_ground_truth_maps(self, boxes: List[Dict], 
+                                   img_width: int, img_height: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate region and affinity ground truth maps"""
+        region_map = np.zeros((img_height, img_width), dtype=np.float32)
+        affinity_map = np.zeros((img_height, img_width), dtype=np.float32)
         
-        if len(texts) < max_words_per_line:
-            print(f"Warning: Not enough text segments. Need at least {max_words_per_line}")
+        if not boxes:
+            return region_map, affinity_map
         
-        print(f"\n=== Document-Style Dataset Generation ===")
-        print(f"Settings:")
-        print(f"  • Lines per image: {min_lines}-{max_lines}")
-        print(f"  • Words per line: {min_words_per_line}-{max_words_per_line}")
-        print(f"  • Layout: Realistic document with paragraphs")
-        print(f"  • Within-paragraph spacing: 2-8px (tight)")
-        print(f"  • Between-paragraph spacing: 20-40px")
-        print(f"  • Augmentation: {augment}")
-        print(f"  • Workers: {workers}")
+        # Generate region map (Gaussian heatmap for each character)
+        for box in boxes:
+            x1, y1, x2, y2 = box['bbox']
+            cx, cy = box['center']
+            
+            # Character region size
+            w = max(x2 - x1, 1)
+            h = max(y2 - y1, 1)
+            
+            # Generate Gaussian heatmap
+            sigma_x = max(w / 3.0, 0.5)
+            sigma_y = max(h / 3.0, 0.5)
+            
+            # Expand region slightly to ensure coverage
+            y_start = max(0, int(y1) - 2)
+            y_end = min(img_height, int(y2) + 3)
+            x_start = max(0, int(x1) - 2)
+            x_end = min(img_width, int(x2) + 3)
+            
+            for y in range(y_start, y_end):
+                for x in range(x_start, x_end):
+                    # Gaussian formula
+                    gaussian_val = np.exp(-((x - cx)**2 / (2 * sigma_x**2) + 
+                                           (y - cy)**2 / (2 * sigma_y**2)))
+                    region_map[y, x] = max(region_map[y, x], gaussian_val)
         
-        total_boxes = 0
+        # Generate affinity map (connections between characters)
+        for i in range(len(boxes) - 1):
+            box1 = boxes[i]
+            box2 = boxes[i + 1]
+            
+            # Center points of two consecutive characters
+            cx1, cy1 = box1['center']
+            cx2, cy2 = box2['center']
+            
+            # Skip if characters are too far apart (likely different words)
+            char_distance = abs(cx2 - cx1)
+            avg_char_width = (box1['bbox'][2] - box1['bbox'][0] + box2['bbox'][2] - box2['bbox'][0]) / 2
+            if char_distance > avg_char_width * 3:  # Threshold for word boundary
+                continue
+            
+            # Midpoint between characters
+            mid_x = (cx1 + cx2) / 2
+            mid_y = (cy1 + cy2) / 2
+            
+            # Draw affinity region
+            w = abs(cx2 - cx1)
+            h = (box1['bbox'][3] - box1['bbox'][1] + box2['bbox'][3] - box2['bbox'][1]) / 2
+            
+            sigma_x = max(w / 2.0, 0.5)
+            sigma_y = max(h / 3.0, 0.5)
+            
+            x_start = int(max(0, min(cx1, cx2) - w/2))
+            x_end = int(min(img_width, max(cx1, cx2) + w/2))
+            y_start = int(max(0, mid_y - h))
+            y_end = int(min(img_height, mid_y + h))
+            
+            for y in range(y_start, y_end):
+                for x in range(x_start, x_end):
+                    gaussian_val = np.exp(-((x - mid_x)**2 / (2 * sigma_x**2) + 
+                                           (y - mid_y)**2 / (2 * sigma_y**2)))
+                    affinity_map[y, x] = max(affinity_map[y, x], gaussian_val)
         
-        # Common args
-        common_kwargs = {
-            'min_lines': min_lines,
-            'max_lines': max_lines,
-            'specific_font_path': font_path,
-            'min_words_per_line': min_words_per_line,
-            'max_words_per_line': max_words_per_line
+        return region_map, affinity_map
+    
+    def apply_augmentation(self, img: Image.Image) -> Image.Image:
+        """Apply random augmentations"""
+        # Random brightness
+        if random.random() > 0.5:
+            brightness = random.uniform(0.7, 1.3)
+            img = Image.eval(img, lambda x: int(min(255, max(0, x * brightness))))
+        
+        # Random contrast
+        if random.random() > 0.5:
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(random.uniform(0.8, 1.2))
+        
+        # Random blur
+        if random.random() > 0.7:
+            img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 1.5)))
+        
+        # Random noise
+        if random.random() > 0.7:
+            img_array = np.array(img)
+            noise = np.random.normal(0, 5, img_array.shape)
+            img_array = np.clip(img_array + noise, 0, 255).astype(np.uint8)
+            img = Image.fromarray(img_array)
+        
+        return img
+    
+    def generate_sample(self, text: str, font_path: str, font_size: int, 
+                       idx: int, language: str = 'unknown', augment: bool = True) -> Dict:
+        """Generate a single training sample"""
+        # Create blank image with random background
+        bg_color = random.randint(240, 255)
+        img = Image.new('RGB', (self.image_width, self.image_height), 
+                       color=(bg_color, bg_color, bg_color))
+        draw = ImageDraw.Draw(img)
+        
+        # Load font
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception as e:
+            # print(f"Failed to load font: {font_path} - {e}")
+            return None
+        
+        try:
+            # Calculate text position
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            
+            # Check if text fits
+            if text_width > self.image_width - 20:
+                # Text too long, skip
+                return None
+            
+            # Random horizontal position with margins
+            margin = 10
+            if text_width < self.image_width - 2 * margin:
+                start_x = random.randint(margin, self.image_width - text_width - margin)
+            else:
+                start_x = margin
+            
+            # Center vertically
+            start_y = (self.image_height - text_height) // 2
+            
+            # Random text color (darker colors for visibility)
+            text_color = (
+                random.randint(0, 80),
+                random.randint(0, 80),
+                random.randint(0, 80)
+            )
+            
+            # Draw text
+            draw.text((start_x, start_y), text, font=font, fill=text_color)
+            
+            # Generate character boxes
+            boxes = self.generate_character_boxes(draw, text, font, start_x, start_y)
+            
+            if not boxes:
+                return None
+            
+            # Generate ground truth maps
+            region_map, affinity_map = self.generate_ground_truth_maps(
+                boxes, self.image_width, self.image_height
+            )
+            
+            # Apply augmentation
+            if augment:
+                img = self.apply_augmentation(img)
+                
+        except Exception as e:
+            # print(f"Error processing sample {idx}: {e}")
+            return None
+        
+        # Save image
+        img_filename = f'img_{idx:06d}.jpg'
+        img_path = os.path.join(self.output_dir, 'images', img_filename)
+        img.save(img_path, quality=95)
+        
+        # Save ground truth maps
+        region_filename = f'region_{idx:06d}.npy'
+        affinity_filename = f'affinity_{idx:06d}.npy'
+        
+        np.save(os.path.join(self.output_dir, 'labels', region_filename), region_map)
+        np.save(os.path.join(self.output_dir, 'labels', affinity_filename), affinity_map)
+        
+        # Save annotation
+        annotation = {
+            'image': img_filename,
+            'text': text,
+            'language': language,
+            'font': os.path.basename(font_path),
+            'font_size': font_size,
+            'num_chars': len(boxes),
+            'boxes': boxes,
+            'region_map': region_filename,
+            'affinity_map': affinity_filename
         }
-
-        # Generate Training
-        print(f"\nGenerating {num_train} training images...")
-        if workers > 1:
-            tasks = []
-            for i in range(num_train):
-                kwargs = common_kwargs.copy()
-                kwargs['augment'] = augment
-                tasks.append((texts, i, 'train', kwargs))
+        
+        annotation_path = os.path.join(self.output_dir, 'annotations', f'anno_{idx:06d}.json')
+        with open(annotation_path, 'w', encoding='utf-8') as f:
+            json.dump(annotation, f, ensure_ascii=False, indent=2)
+        
+        return annotation
+    
+    def generate_dataset(self, text_files: Union[str, Dict[str, str]], 
+                        font_dir: Union[str, Dict[str, str]], 
+                        num_samples: int = 1000,
+                        font_size_range: Tuple[int, int] = (20, 48),
+                        augment: bool = True,
+                        language_ratio: Dict[str, float] = None) -> None:
+        """Generate complete dataset with multi-language support
+        
+        Args:
+            text_files: Single file or dict like {'khmer': 'khmer.txt', 'english': 'english.txt'}
+            font_dir: Single dir or dict like {'khmer': 'fonts/khmer/', 'english': 'fonts/english/'}
+            num_samples: Total samples to generate
+            font_size_range: (min_size, max_size)
+            augment: Apply augmentations
+            language_ratio: Dict like {'khmer': 0.7, 'english': 0.3}
+        """
+        print("\n" + "="*60)
+        print("  CRAFT Dataset Generator")
+        print("="*60)
+        
+        # Handle text files
+        if isinstance(text_files, dict):
+            text_data = {}
+            for lang, file in text_files.items():
+                lines = self.load_text_lines(file)
+                if lines:
+                    text_data[lang] = lines
+                    print(f"✓ Loaded {len(lines)} {lang} text lines")
+                else:
+                    print(f"⚠ Warning: No text loaded for {lang}")
             
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(self.output_dir, self.fonts_dir)) as executor:
-                results = list(tqdm(executor.map(_process_wrapper, tasks), total=num_train, desc="Training Set", unit="img"))
-                total_boxes += sum(results)
+            if not text_data:
+                print("❌ Error: No text data loaded!")
+                return
+                
+            # Set default ratio
+            if language_ratio is None:
+                language_ratio = {lang: 1.0/len(text_data) for lang in text_data}
         else:
-            for i in tqdm(range(num_train), desc="Training Set", unit="img"):
-                boxes = self.generate_single_image(
-                    texts, i, 'train',
-                    augment=augment,
-                    **common_kwargs
-                )
-                total_boxes += boxes
+            text_data = {'default': self.load_text_lines(text_files)}
+            language_ratio = {'default': 1.0}
+            if text_data['default']:
+                print(f"✓ Loaded {len(text_data['default'])} text lines")
+            else:
+                print("❌ Error: No text data loaded!")
+                return
         
-        # Generate Validation
-        print(f"\nGenerating {num_val} validation images...")
-        if workers > 1:
-            tasks = []
-            for i in range(num_val):
-                kwargs = common_kwargs.copy()
-                kwargs['augment'] = False
-                tasks.append((texts, i, 'val', kwargs))
+        # Handle font directories
+        if isinstance(font_dir, dict):
+            fonts_data = {}
+            for lang, dir_path in font_dir.items():
+                fonts = self.get_font_list(dir_path)
+                if fonts:
+                    fonts_data[lang] = fonts
+                    print(f"✓ Found {len(fonts)} {lang} fonts")
+                else:
+                    print(f"⚠ Warning: No fonts found for {lang}")
+        else:
+            fonts_data = {'default': self.get_font_list(font_dir)}
+            if fonts_data['default']:
+                print(f"✓ Found {len(fonts_data['default'])} fonts")
+            else:
+                print("❌ Error: No fonts found!")
+                return
+        
+        if not any(fonts_data.values()):
+            print("❌ Error: No fonts available!")
+            return
+        
+        print(f"\nGenerating {num_samples} samples...")
+        print(f"Font size range: {font_size_range[0]}-{font_size_range[1]}")
+        print(f"Augmentation: {'Enabled' if augment else 'Disabled'}")
+        if len(language_ratio) > 1:
+            print(f"Language ratio: {language_ratio}")
+        print("="*60 + "\n")
+        
+        # Generate samples
+        dataset_info = []
+        successful = 0
+        
+        for i in range(num_samples):
+            # Select language
+            lang = random.choices(list(language_ratio.keys()), 
+                                weights=list(language_ratio.values()))[0]
             
-            # Re-use executor? No, context manager closed it. Creating new one is fine.
-            # We could wrap both in one executor but that's fine.
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(self.output_dir, self.fonts_dir)) as executor:
-                results = list(tqdm(executor.map(_process_wrapper, tasks), total=num_val, desc="Validation Set", unit="img"))
-                total_boxes += sum(results)
-        else:
-            for i in tqdm(range(num_val), desc="Validation Set", unit="img"):
-                boxes = self.generate_single_image(
-                    texts, i, 'val',
-                    augment=False,
-                    **common_kwargs
-                )
-                total_boxes += boxes
+            # Get text
+            if lang not in text_data or not text_data[lang]:
+                continue
+            text = random.choice(text_data[lang])
+            
+            # Get font
+            font_key = lang if lang in fonts_data else 'default'
+            if font_key not in fonts_data or not fonts_data[font_key]:
+                continue
+            font_path = random.choice(fonts_data[font_key])
+            
+            # Random font size
+            font_size = random.randint(font_size_range[0], font_size_range[1])
+            
+            # Generate sample
+            annotation = self.generate_sample(text, font_path, font_size, i, lang, augment)
+            
+            if annotation:
+                dataset_info.append(annotation)
+                successful += 1
+            
+            if (i + 1) % 100 == 0:
+                print(f"Progress: {i + 1}/{num_samples} ({successful} successful)")
         
-        # Create YAML
-        yaml_content = f"""# Khmer Text Line Detection Dataset (Document-Style)
-path: {os.path.abspath(self.output_dir)}
-train: images/train
-val: images/val
+        # Calculate statistics
+        lang_counts = {}
+        for item in dataset_info:
+            lang = item.get('language', 'unknown')
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+        
+        # Save dataset info
+        dataset_summary = {
+            'num_samples': len(dataset_info),
+            'successful_samples': successful,
+            'image_size': [self.image_width, self.image_height],
+            'language_distribution': lang_counts,
+            'font_size_range': font_size_range,
+            'augmentation_enabled': augment
+        }
+        
+        with open(os.path.join(self.output_dir, 'dataset_info.json'), 'w', encoding='utf-8') as f:
+            json.dump(dataset_summary, f, ensure_ascii=False, indent=2)
+        
+        # Save detailed annotations separately
+        with open(os.path.join(self.output_dir, 'annotations_list.json'), 'w', encoding='utf-8') as f:
+            json.dump(dataset_info, f, ensure_ascii=False, indent=2)
+        
+        print(f"\n{'='*60}")
+        print(f"✅ Dataset generation complete!")
+        print(f"{'='*60}")
+        print(f"  Total samples: {len(dataset_info)}/{num_samples}")
+        print(f"  Success rate: {successful/num_samples*100:.1f}%")
+        if len(lang_counts) > 1:
+            print(f"  Language distribution:")
+            for lang, count in lang_counts.items():
+                print(f"    - {lang}: {count} ({count/len(dataset_info)*100:.1f}%)")
+        print(f"  Output directory: {self.output_dir}")
+        print(f"{'='*60}\n")
 
-# Classes
-nc: 1
-names: ['text']
-"""
-        yaml_path = f'{self.output_dir}/data.yaml'
-        with open(yaml_path, 'w') as f:
-            f.write(yaml_content)
-        
-        print(f"\n✓ Dataset generation complete!")
-        print(f"✓ Total images: {num_train + num_val}")
-        print(f"✓ Total line boxes: {total_boxes}")
-        print(f"✓ Avg lines per image: {total_boxes/(num_train+num_val):.1f}")
-        print(f"✓ Config: {yaml_path}")
-        print(f"\n=== Document Formatting Features ===")
-        print(f"✓ Paragraph structure (2-5 lines per paragraph)")
-        print(f"✓ Tight within-paragraph spacing (2-8px)")
-        print(f"✓ Realistic line-height (1.2-1.5x text height)")
-        print(f"✓ Paragraph breaks with extra spacing (20-40px)")
-        print(f"✓ Consistent font size per document")
-        print(f"✓ Left-aligned text (70%), justified (25%), centered (5%)")
-        print(f"✓ {min_words_per_line}-{max_words_per_line} words per line")
-        print(f"\nThis mimics real documents where closely-spaced lines")
-        print(f"might be detected as a single text block!")
-        print(f"\nNext: Train with 'kiri-ocr train-detector'")
 
 def generate_detector_dataset_command(args):
-    """CLI Command handler"""
-    generator = DetectorDatasetGenerator(
+    """CLI Command handler for kiri-ocr"""
+    
+    # Parse multi-language arguments if provided
+    text_files = args.text_file
+    font_dirs = args.fonts_dir
+    language_ratio = None
+    
+    # Check for multi-language format (lang:file)
+    if isinstance(args.text_file, str) and ':' in args.text_file and not os.path.exists(args.text_file):
+        # Multi-language mode
+        text_files = {}
+        for item in args.text_file.split(','):
+            if ':' in item:
+                lang, file = item.split(':', 1)
+                text_files[lang.strip()] = file.strip()
+    
+    # Check for multi-language fonts (lang:dir)
+    if isinstance(args.fonts_dir, str) and ':' in args.fonts_dir and not os.path.exists(args.fonts_dir):
+        font_dirs = {}
+        for item in args.fonts_dir.split(','):
+            if ':' in item:
+                lang, dir_path = item.split(':', 1)
+                font_dirs[lang.strip()] = dir_path.strip()
+    
+    # Parse language ratio if provided (e.g., "khmer:0.7,english:0.3")
+    if hasattr(args, 'language_ratio') and args.language_ratio:
+        language_ratio = {}
+        for item in args.language_ratio.split(','):
+            lang, ratio = item.split(':')
+            language_ratio[lang.strip()] = float(ratio.strip())
+    
+    # Initialize generator
+    generator = MultilingualDatasetGenerator(
         output_dir=args.output,
-        fonts_dir=args.fonts_dir
+        image_width=512,
+        image_height=64
     )
     
-    TEXT_FILE = args.text_file
+    # Calculate total samples
+    num_samples = args.num_train + args.num_val
     
-    if not os.path.exists(TEXT_FILE):
-        print(f"Error: Text file '{TEXT_FILE}' not found!")
-        print("Creating sample text file...")
-        sample_texts = [
-            "ជំរាបសួរ", "សូមអរគុណ", "អ្នកមានសុខភាពល្អទេ",
-            "ខ្ញុំសុខសប្បាយ", "តើអ្នកទៅណា", "យើងជួបគ្នាម្តងទៀត",
-            "សូមអត់ទោស", "ខ្ញុំមិនយល់ទេ", "តើអ្នកនិយាយភាសាអង់គ្លេសបានទេ",
-            "សូមជួយខ្ញុំផង", "ធ្វើដំណើរប្រុងប្រយ័ត្ន", "ជាទីស្រលាញ់",
-            "នេះគឺជាឯកសារ", "របស់យើង", "សរសេរជាភាសាខ្មែរ",
-            "ក្នុងឆ្នាំ២០២៦", "ខែមករា", "ថ្ងៃទី២២",
-        ]
-        with open(TEXT_FILE, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(sample_texts * 10))
-        print(f"Created sample file: {TEXT_FILE}")
-    
-    min_words = getattr(args, 'min_words_per_line', 2)
-    max_words = getattr(args, 'max_words_per_line', 5)
-    
+    # Generate dataset
     generator.generate_dataset(
-        text_file=TEXT_FILE,
-        font_path=args.font,
-        num_train=args.num_train,
-        num_val=args.num_val,
-        min_lines=args.min_lines,
-        max_lines=args.max_lines,
-        min_words_per_line=min_words,
-        max_words_per_line=max_words,
+        text_files=text_files,
+        font_dir=font_dirs,
+        num_samples=num_samples,
+        font_size_range=(24, 48),
         augment=not args.no_augment,
-        workers=args.workers
+        language_ratio=language_ratio
     )
