@@ -229,13 +229,37 @@ def train_command(args):
     device = args.device if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 1. HANDLE VOCAB (The new auto logic)
+    # 1. HANDLE VOCAB & DATASET LOADING
     vocab_path = args.vocab
     
+    hf_ds_train = None
+    if hasattr(args, 'hf_dataset') and args.hf_dataset:
+        print(f"  ⬇️ Loading HF dataset: {args.hf_dataset}")
+        subset = getattr(args, "hf_subset", None)
+        try:
+             hf_ds_train = load_dataset(args.hf_dataset, subset, split=args.hf_train_split)
+        except Exception as e:
+             print(f"❌ Error loading dataset: {e}")
+             return
+
     # If vocab not provided OR file doesn't exist, create it
     if not vocab_path or not os.path.exists(vocab_path):
         generated_vocab_path = os.path.join(args.output_dir, "vocab_auto.json")
-        vocab_path = build_vocab_from_dataset(args.train_labels, generated_vocab_path)
+        
+        if hf_ds_train:
+             # Build from HF
+             vocab_path = build_vocab_from_hf_dataset(hf_ds_train, generated_vocab_path, text_col=args.hf_text_col)
+        elif args.train_labels:
+             # Build from Local
+             if os.path.exists(args.train_labels):
+                 vocab_path = build_vocab_from_dataset(args.train_labels, generated_vocab_path)
+             else:
+                 print(f"❌ Error: Train labels file not found: {args.train_labels}")
+                 return
+        else:
+             print("❌ Error: No dataset provided (hf-dataset or train-labels) to build vocab.")
+             return
+
         if vocab_path is None:
             print("❌ Failed to generate vocabulary. Exiting.")
             return
@@ -269,28 +293,9 @@ def train_command(args):
     # 4. Datasets
     train_loader = None
     
-    if hasattr(args, 'hf_dataset') and args.hf_dataset:
-        print(f"  ⬇️ Loading HF dataset: {args.hf_dataset}")
-        subset = getattr(args, "hf_subset", None)
-        try:
-            ds = load_dataset(args.hf_dataset, subset, split=args.hf_train_split)
-        except Exception as e:
-            print(f"❌ Error loading dataset: {e}")
-            return
-
-        # Auto-build vocab if needed
-        if not os.path.exists(vocab_path) and vocab_path == args.vocab:
-             # Only if user provided specific vocab path that doesn't exist, we fail?
-             # Or if we defaulted to auto, we build.
-             # Earlier code block handled file-based vocab build.
-             # We need to handle HF-based vocab build if vocab_path refers to the auto path.
-             if "vocab_auto.json" in vocab_path:
-                 vocab_path = build_vocab_from_hf_dataset(ds, vocab_path, text_col=args.hf_text_col)
-                 # Re-init tokenizer with new vocab
-                 tokenizer = CharTokenizer(vocab_path, cfg)
-        
+    if hf_ds_train:
         train_ds = HFTransformerDataset(
-            ds,
+            hf_ds_train,
             tokenizer,
             img_height=args.height,
             image_col=args.hf_image_col,

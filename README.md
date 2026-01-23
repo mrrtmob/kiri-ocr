@@ -19,6 +19,7 @@
 - **Bi-lingual**: Native support for English and Khmer (and mixed).
 - **Document Processing**: Automatic text line and word detection.
 - **Easy to Use**: Simple Python API.
+- **Transformer Architecture**: Supports advanced Hybrid Context Transformer models for higher accuracy.
 
 ## 📊 Dataset
 
@@ -139,7 +140,7 @@ You can train using CLI arguments or a configuration file.
    kiri-ocr train --config config.json
    ```
 
-**Option B: Using CLI Arguments**
+**Option B: Using CLI Arguments (Standard CRNN)**
 
 ```bash
 kiri-ocr train \
@@ -171,13 +172,35 @@ kiri-ocr train \
 * `--hf-subset`: Dataset configuration/subset name (optional).
 * `--hf-streaming`: Stream the dataset instead of downloading it fully.
 
-To use a specific subset/config (if the dataset has multiple):
+**Option D: Training the Transformer (Infinity) Model**
+
+Kiri OCR supports a powerful Hybrid Context Transformer architecture.
 
 ```bash
 kiri-ocr train \
-    --hf-dataset mrrtmob/km_en_image_line \
-    --hf-subset default \
-    ...
+    --arch transformer \
+    --hf-dataset your-dataset-id \
+    --output-dir output_transformer \
+    --height 48 \
+    --batch-size 32 \
+    --epochs 100
+```
+
+*   `--arch transformer`: Switches to the Transformer pipeline.
+*   `--height`: Must be **48** for this architecture.
+*   `--vocab`: Path to `vocab_char.json`. If not provided, it will be auto-generated from your dataset.
+
+**Using the Transformer Model in Python:**
+
+```python
+from kiri_ocr import OCR
+
+# Load your custom transformer model
+ocr = OCR(model_path="output_transformer/best.pt")
+
+# Kiri OCR automatically detects the model type!
+text, conf = ocr.recognize_single_line_image("image.jpg")
+print(text)
 ```
 
 ### Step 3: Train the Detector (Optional)
