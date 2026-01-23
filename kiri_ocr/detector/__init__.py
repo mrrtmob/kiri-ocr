@@ -62,9 +62,11 @@ class TextDetector:
              else:
                  try:
                      self.craft_detector = CRAFTDetector()
-                     # Load weights if path exists (TODO: implement load_weights in CRAFTDetector)
-                     # if self.model_path and os.path.exists(self.model_path):
-                     #     self.craft_detector.load_weights(self.model_path)
+                     # Load weights
+                     if self.model_path and os.path.exists(self.model_path):
+                         self.craft_detector.load_weights(self.model_path)
+                     elif self.model_path:
+                         print(f"Warning: CRAFT model path not found: {self.model_path}")
                  except Exception as e:
                      print(f"Error loading CRAFT detector: {e}. Falling back to legacy.")
                      self.method = 'legacy'
@@ -91,7 +93,16 @@ class TextDetector:
                 padding = self.kwargs.get('padding', 0)
                 
                 for box in detected_boxes:
-                    x1, y1, x2, y2 = box
+                    # Handle CRAFT polygon output (4, 2)
+                    if hasattr(box, 'shape') and box.shape == (4, 2):
+                        x_min = np.min(box[:, 0])
+                        y_min = np.min(box[:, 1])
+                        x_max = np.max(box[:, 0])
+                        y_max = np.max(box[:, 1])
+                        x1, y1, x2, y2 = x_min, y_min, x_max, y_max
+                    else:
+                        x1, y1, x2, y2 = box
+                        
                     w = x2 - x1
                     h = y2 - y1
                     
@@ -103,7 +114,7 @@ class TextDetector:
                          h += 2 * padding
                     
                     # Confidence is not returned by simple detect_text, assume 1.0 or extract if possible
-                    boxes.append(TextBox(x1, y1, w, h, confidence=1.0, level=DetectionLevel.LINE))
+                    boxes.append(TextBox(int(x1), int(y1), int(w), int(h), confidence=1.0, level=DetectionLevel.LINE))
                 
                 boxes = sorted(boxes, key=lambda b: b.y)
                 boxes = self._merge_overlapping_boxes(boxes)

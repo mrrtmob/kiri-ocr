@@ -296,8 +296,9 @@ def main():
     gen_det_parser.add_argument('--output', default='detector_dataset', help='Output directory')
     gen_det_parser.add_argument('--num-train', type=int, default=800, help='Number of training images')
     gen_det_parser.add_argument('--num-val', type=int, default=200, help='Number of validation images')
-    gen_det_parser.add_argument('--min-lines', type=int, default=15, help='Min text lines per page')
-    gen_det_parser.add_argument('--max-lines', type=int, default=50, help='Max text lines per page')
+    gen_det_parser.add_argument('--min-lines', type=int, default=15, help='Min text lines per page (unused)')
+    gen_det_parser.add_argument('--max-lines', type=int, default=50, help='Max text lines per page (unused)')
+    gen_det_parser.add_argument('--image-height', type=int, default=512, help='Image height (default: 512)')
     gen_det_parser.add_argument('--no-augment', action='store_true', help='Disable augmentation')
     gen_det_parser.add_argument('--workers', type=int, default=1, help='Number of worker processes')
 

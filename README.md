@@ -182,11 +182,11 @@ kiri-ocr train \
 
 ### Step 3: Train the Detector (Optional)
 
-Kiri OCR uses a YOLOv8-based detector to find text regions on a page. You can train this on your own data if needed.
+Kiri OCR uses a CRAFT-based detector (Character Region Awareness for Text Detection) to find text regions. You can train this on your own data if needed.
 
 1. **Generate Detector Dataset**:
 
-   Create a synthetic dataset for training the YOLO object detector. This command generates page-like images with multiple text lines.
+   Create a synthetic dataset for training the CRAFT detector. This command generates images with character-level ground truth maps (region and affinity).
 
    ```bash
    kiri-ocr generate-detector \
@@ -200,31 +200,34 @@ Kiri OCR uses a YOLOv8-based detector to find text regions on a page. You can tr
    **Arguments:**
 
    * `--text-file`: Path to source text file (one line per text sample).
-   * `--fonts-dir`: Directory containing `.ttf` font files to randomly select from.
-   * `--font`: (Optional) Use a specific font file instead of a directory.
+   * `--fonts-dir`: Directory containing `.ttf` font files.
    * `--output`: Output directory for the dataset (default: `detector_dataset`).
-   * `--num-train`: Number of training images to generate (default: 800).
-   * `--num-val`: Number of validation images to generate (default: 200).
-   * `--min-lines`: Minimum number of text lines per generated page (default: 3).
-   * `--max-lines`: Maximum number of text lines per generated page (default: 20).
-   * `--no-augment`: Disable random augmentations (noise, blur, etc.).
+   * `--num-train`: Number of training images to generate.
+   * `--num-val`: Number of validation images to generate.
+   * `--no-augment`: Disable random augmentations.
 
-   This creates a `detector_dataset/` directory structured for YOLO training (containing `train/`, `val/`, and `data.yaml`).
+   This creates a `detector_dataset/` directory containing images and `.npy` label maps.
+
 2. **Train Detector**:
 
    ```bash
    kiri-ocr train-detector \
        --epochs 50 \
-       --model-size n
+       --batch-size 8 \
+       --name my_craft_model
    ```
 
-   * `--model-size`: 'n' (nano), 's' (small), 'm' (medium). 'n' is fastest.
+   **Arguments:**
+   * `--epochs`: Number of training epochs.
+   * `--batch-size`: Batch size (adjust based on your GPU memory).
+   * `--name`: Name for the training run (models saved in `runs/detect/{name}`).
+
 3. **Use Custom Detector**:
-   The system will automatically look for the trained model in `runs/detect/khmer_text_detector/weights/best.pt`. You can also specify it in Python:
+   The system will save the best model to `runs/detect/{name}/weights/best.pth`. You can also specify it in Python:
 
    ```python
    from kiri_ocr.detector import TextDetector
-   detector = TextDetector(method='yolo', model_path='path/to/best.pt')
+   detector = TextDetector(method='craft', model_path='runs/detect/my_craft_model/weights/best.pth')
    ```
 
 ### Fine-Tuning Recognition

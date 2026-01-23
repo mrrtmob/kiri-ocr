@@ -13,7 +13,7 @@ from pathlib import Path
 class MultilingualDatasetGenerator:
     """Dataset generator supporting multiple languages (Khmer, English, etc.)"""
     
-    def __init__(self, output_dir='dataset', image_width=512, image_height=64):
+    def __init__(self, output_dir='dataset', image_width=512, image_height=512):
         self.output_dir = output_dir
         self.image_width = image_width
         self.image_height = image_height
@@ -23,6 +23,41 @@ class MultilingualDatasetGenerator:
         os.makedirs(os.path.join(output_dir, 'labels'), exist_ok=True)
         os.makedirs(os.path.join(output_dir, 'annotations'), exist_ok=True)
         
+    def is_text_supported(self, font, text):
+        """Check if font supports the characters in text"""
+        try:
+            # Check against 'notdef' character (box)
+            # Usually \0 or \uFFFF produces the notdef glyph
+            notdef_char = '\uFFFF'
+            try:
+                notdef_mask = font.getmask(notdef_char)
+                notdef_bbox = font.getbbox(notdef_char)
+            except:
+                # If getmask fails, maybe font is broken or doesn't have notdef
+                return True
+
+            # If font yields empty for notdef (some fonts do), we can't rely on this check easily
+            # But usually it returns a rectangle.
+            
+            for char in text:
+                if char.isspace(): continue
+                
+                try:
+                    char_bbox = font.getbbox(char)
+                    # If char bbox matches notdef bbox exactly, it's likely unsupported
+                    # Note: This is a heuristic. Some legit chars might match notdef dimensions.
+                    # A better check is mask bytes comparison
+                    
+                    if char_bbox == notdef_bbox:
+                        char_mask = font.getmask(char)
+                        if bytes(char_mask) == bytes(notdef_mask):
+                            return False
+                except:
+                    continue
+            return True
+        except:
+            return True
+
     def load_text_lines(self, text_file: Union[str, List[str]]) -> List[str]:
         """Load text lines from file(s)"""
         if isinstance(text_file, str):
@@ -103,15 +138,20 @@ class MultilingualDatasetGenerator:
             w = max(x2 - x1, 1)
             h = max(y2 - y1, 1)
             
-            # Generate Gaussian heatmap
-            sigma_x = max(w / 3.0, 0.5)
-            sigma_y = max(h / 3.0, 0.5)
+            # Add padding based on size (adaptive)
+            # CRAFT boxes usually cover the character + some margin
+            # Increasing sigma makes the heatmap spread more
+            sigma_x = max(w / 2.5, 1.0) # Increased spread
+            sigma_y = max(h / 2.5, 1.0)
             
-            # Expand region slightly to ensure coverage
-            y_start = max(0, int(y1) - 2)
-            y_end = min(img_height, int(y2) + 3)
-            x_start = max(0, int(x1) - 2)
-            x_end = min(img_width, int(x2) + 3)
+            # Expand region slightly to ensure coverage of tails/accents
+            pad_x = int(w * 0.2)
+            pad_y = int(h * 0.2)
+            
+            y_start = max(0, int(y1) - pad_y)
+            y_end = min(img_height, int(y2) + pad_y)
+            x_start = max(0, int(x1) - pad_x)
+            x_end = min(img_width, int(x2) + pad_x)
             
             for y in range(y_start, y_end):
                 for x in range(x_start, x_end):
@@ -125,15 +165,20 @@ class MultilingualDatasetGenerator:
             box1 = boxes[i]
             box2 = boxes[i + 1]
             
-            # Center points of two consecutive characters
-            cx1, cy1 = box1['center']
-            cx2, cy2 = box2['center']
-            
+            # Skip if vertical distance is large (different lines)
+            if abs(box1['center'][1] - box2['center'][1]) > 20:
+                continue
+
             # Skip if characters are too far apart (likely different words)
-            char_distance = abs(cx2 - cx1)
+            char_distance = abs(box2['center'][0] - box1['center'][0])
             avg_char_width = (box1['bbox'][2] - box1['bbox'][0] + box2['bbox'][2] - box2['bbox'][0]) / 2
+            
             if char_distance > avg_char_width * 3:  # Threshold for word boundary
                 continue
+            
+            # Center points
+            cx1, cy1 = box1['center']
+            cx2, cy2 = box2['center']
             
             # Midpoint between characters
             mid_x = (cx1 + cx2) / 2
@@ -143,8 +188,8 @@ class MultilingualDatasetGenerator:
             w = abs(cx2 - cx1)
             h = (box1['bbox'][3] - box1['bbox'][1] + box2['bbox'][3] - box2['bbox'][1]) / 2
             
-            sigma_x = max(w / 2.0, 0.5)
-            sigma_y = max(h / 3.0, 0.5)
+            sigma_x = max(w / 2.0, 1.0)
+            sigma_y = max(h / 2.5, 1.0)
             
             x_start = int(max(0, min(cx1, cx2) - w/2))
             x_end = int(min(img_width, max(cx1, cx2) + w/2))
@@ -184,9 +229,9 @@ class MultilingualDatasetGenerator:
         
         return img
     
-    def generate_sample(self, text: str, font_path: str, font_size: int, 
+    def generate_sample(self, text_pool: List[str], font_path: str, font_size: int, 
                        idx: int, language: str = 'unknown', augment: bool = True) -> Dict:
-        """Generate a single training sample"""
+        """Generate a training sample (potentially multi-line)"""
         # Create blank image with random background
         bg_color = random.randint(240, 255)
         img = Image.new('RGB', (self.image_width, self.image_height), 
@@ -197,58 +242,107 @@ class MultilingualDatasetGenerator:
         try:
             font = ImageFont.truetype(font_path, font_size)
         except Exception as e:
-            # print(f"Failed to load font: {font_path} - {e}")
             return None
         
-        try:
-            # Calculate text position
-            bbox = draw.textbbox((0, 0), text, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
+        all_boxes = []
+        
+        # Determine number of lines (1 to 5)
+        # If image height is small (e.g. 64), force 1 line
+        if self.image_height < 100:
+            num_lines = 1
+        else:
+            num_lines = random.randint(1, 5)
             
-            # Check if text fits
-            if text_width > self.image_width - 20:
-                # Text too long, skip
-                return None
-            
-            # Random horizontal position with margins
-            margin = 10
-            if text_width < self.image_width - 2 * margin:
-                start_x = random.randint(margin, self.image_width - text_width - margin)
-            else:
-                start_x = margin
-            
-            # Center vertically
-            start_y = (self.image_height - text_height) // 2
-            
-            # Random text color (darker colors for visibility)
-            text_color = (
-                random.randint(0, 80),
-                random.randint(0, 80),
-                random.randint(0, 80)
-            )
-            
-            # Draw text
-            draw.text((start_x, start_y), text, font=font, fill=text_color)
-            
-            # Generate character boxes
-            boxes = self.generate_character_boxes(draw, text, font, start_x, start_y)
-            
-            if not boxes:
-                return None
-            
-            # Generate ground truth maps
-            region_map, affinity_map = self.generate_ground_truth_maps(
-                boxes, self.image_width, self.image_height
-            )
-            
-            # Apply augmentation
-            if augment:
-                img = self.apply_augmentation(img)
+        current_y = random.randint(20, 60)
+        line_spacing = font_size + random.randint(10, 30)
+        
+        full_text = []
+        
+        for _ in range(num_lines):
+            if current_y + font_size > self.image_height - 20:
+                break
                 
-        except Exception as e:
-            # print(f"Error processing sample {idx}: {e}")
+            # Construct dense line by concatenating multiple snippets
+            text_parts = []
+            test_text = ""
+            
+            # Try to fill at least 50% of width or up to max width
+            target_width = random.randint(int(self.image_width * 0.5), self.image_width - 40)
+            
+            for _ in range(10): # Max attempts to add words
+                part = random.choice(text_pool)
+                
+                # Check if font supports this text part
+                if not self.is_text_supported(font, part):
+                    continue
+                    
+                new_text = test_text + " " + part if test_text else part
+                
+                try:
+                    bbox = draw.textbbox((0, 0), new_text, font=font)
+                    w = bbox[2] - bbox[0]
+                    if w > self.image_width - 40: # Too wide
+                        break
+                    
+                    test_text = new_text
+                    text_parts.append(part)
+                    
+                    if w > target_width: # Reached target width
+                        break
+                except:
+                    break
+            
+            if not text_parts:
+                continue
+                
+            text = test_text
+            
+            try:
+                # Calculate text position
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+                
+                # Random horizontal position
+                margin = 20
+                if text_width < self.image_width - 2 * margin:
+                    start_x = random.randint(margin, self.image_width - text_width - margin)
+                else:
+                    start_x = margin
+                
+                start_y = current_y
+                
+                # Random text color
+                text_color = (
+                    random.randint(0, 80),
+                    random.randint(0, 80),
+                    random.randint(0, 80)
+                )
+                
+                # Draw text
+                draw.text((start_x, start_y), text, font=font, fill=text_color)
+                
+                # Generate character boxes for this line
+                line_boxes = self.generate_character_boxes(draw, text, font, start_x, start_y)
+                all_boxes.extend(line_boxes)
+                full_text.append(text)
+                
+                current_y += text_height + random.randint(15, 40) # Variable line spacing
+                
+            except Exception as e:
+                continue
+        
+        if not all_boxes:
             return None
+            
+        # Generate ground truth maps with ALL boxes
+        region_map, affinity_map = self.generate_ground_truth_maps(
+            all_boxes, self.image_width, self.image_height
+        )
+        
+        # Apply augmentation
+        if augment:
+            img = self.apply_augmentation(img)
         
         # Save image
         img_filename = f'img_{idx:06d}.jpg'
@@ -265,12 +359,12 @@ class MultilingualDatasetGenerator:
         # Save annotation
         annotation = {
             'image': img_filename,
-            'text': text,
+            'text': "\n".join(full_text),
             'language': language,
             'font': os.path.basename(font_path),
             'font_size': font_size,
-            'num_chars': len(boxes),
-            'boxes': boxes,
+            'num_chars': len(all_boxes),
+            'boxes': all_boxes,
             'region_map': region_filename,
             'affinity_map': affinity_filename
         }
@@ -287,18 +381,9 @@ class MultilingualDatasetGenerator:
                         font_size_range: Tuple[int, int] = (20, 48),
                         augment: bool = True,
                         language_ratio: Dict[str, float] = None) -> None:
-        """Generate complete dataset with multi-language support
-        
-        Args:
-            text_files: Single file or dict like {'khmer': 'khmer.txt', 'english': 'english.txt'}
-            font_dir: Single dir or dict like {'khmer': 'fonts/khmer/', 'english': 'fonts/english/'}
-            num_samples: Total samples to generate
-            font_size_range: (min_size, max_size)
-            augment: Apply augmentations
-            language_ratio: Dict like {'khmer': 0.7, 'english': 0.3}
-        """
+        """Generate complete dataset with multi-language support"""
         print("\n" + "="*60)
-        print("  CRAFT Dataset Generator")
+        print("  CRAFT Dataset Generator (Multi-line Support)")
         print("="*60)
         
         # Handle text files
@@ -366,10 +451,10 @@ class MultilingualDatasetGenerator:
             lang = random.choices(list(language_ratio.keys()), 
                                 weights=list(language_ratio.values()))[0]
             
-            # Get text
+            # Get text pool for language
             if lang not in text_data or not text_data[lang]:
                 continue
-            text = random.choice(text_data[lang])
+            text_pool = text_data[lang]
             
             # Get font
             font_key = lang if lang in fonts_data else 'default'
@@ -380,8 +465,8 @@ class MultilingualDatasetGenerator:
             # Random font size
             font_size = random.randint(font_size_range[0], font_size_range[1])
             
-            # Generate sample
-            annotation = self.generate_sample(text, font_path, font_size, i, lang, augment)
+            # Generate sample (pass text pool)
+            annotation = self.generate_sample(text_pool, font_path, font_size, i, lang, augment)
             
             if annotation:
                 dataset_info.append(annotation)
@@ -418,10 +503,6 @@ class MultilingualDatasetGenerator:
         print(f"{'='*60}")
         print(f"  Total samples: {len(dataset_info)}/{num_samples}")
         print(f"  Success rate: {successful/num_samples*100:.1f}%")
-        if len(lang_counts) > 1:
-            print(f"  Language distribution:")
-            for lang, count in lang_counts.items():
-                print(f"    - {lang}: {count} ({count/len(dataset_info)*100:.1f}%)")
         print(f"  Output directory: {self.output_dir}")
         print(f"{'='*60}\n")
 
@@ -436,7 +517,6 @@ def generate_detector_dataset_command(args):
     
     # Check for multi-language format (lang:file)
     if isinstance(args.text_file, str) and ':' in args.text_file and not os.path.exists(args.text_file):
-        # Multi-language mode
         text_files = {}
         for item in args.text_file.split(','):
             if ':' in item:
@@ -451,18 +531,21 @@ def generate_detector_dataset_command(args):
                 lang, dir_path = item.split(':', 1)
                 font_dirs[lang.strip()] = dir_path.strip()
     
-    # Parse language ratio if provided (e.g., "khmer:0.7,english:0.3")
+    # Parse language ratio if provided
     if hasattr(args, 'language_ratio') and args.language_ratio:
         language_ratio = {}
         for item in args.language_ratio.split(','):
             lang, ratio = item.split(':')
             language_ratio[lang.strip()] = float(ratio.strip())
+            
+    # Get image height from args or default to 512 for multi-line
+    image_height = getattr(args, 'image_height', 512)
     
     # Initialize generator
     generator = MultilingualDatasetGenerator(
         output_dir=args.output,
         image_width=512,
-        image_height=64
+        image_height=image_height
     )
     
     # Calculate total samples
