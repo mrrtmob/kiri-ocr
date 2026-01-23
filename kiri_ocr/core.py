@@ -15,6 +15,8 @@ class OCR:
     _model_cache = {}
 
     def __init__(self, model_path='mrrtmob/kiri-ocr',
+                 det_model_path=None,
+                 det_conf_threshold=0.5,
                  charset_path='models/charset_lite.txt',
                  language='mixed',
                  padding=10,
@@ -23,6 +25,8 @@ class OCR:
         """
         Args:
             model_path: Path to trained model (.kiri or .pth)
+            det_model_path: Path to YOLO detector model (optional, defaults to auto-discovery)
+            det_conf_threshold: Confidence threshold for YOLO detector (default: 0.5)
             charset_path: Path to character set (used if model doesn't contain charset)
             language: 'english', 'khmer', or 'mixed'
             padding: Pixels to pad around detected boxes (default: 10)
@@ -33,6 +37,8 @@ class OCR:
         self.verbose = verbose
         self.language = language
         self.padding = padding
+        self.det_model_path = det_model_path
+        self.det_conf_threshold = det_conf_threshold
         
         # Resolve model path
         model_file = Path(model_path)
@@ -154,7 +160,10 @@ class OCR:
         """Lazy-load detector only when needed"""
         if self._detector is None:
             from .detector import TextDetector
-            self._detector = TextDetector()
+            self._detector = TextDetector(
+                model_path=self.det_model_path,
+                conf_threshold=self.det_conf_threshold
+            )
         return self._detector
 
     def _preprocess_region(self, img, box, extra_padding=5):

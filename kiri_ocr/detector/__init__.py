@@ -32,15 +32,22 @@ class TextDetector:
             model_path: Path to YOLO model (optional)
             **kwargs: Arguments passed to ImageProcessingTextDetector
         """
+        self.conf_threshold = kwargs.pop('conf_threshold', 0.25)
         self.method = method
         self.kwargs = kwargs
         self.yolo_detector = None
         
         # Try to resolve model path if not provided
         if model_path is None:
-             default_path = 'runs/detect/khmer_text_detector/weights/best.pt'
-             if os.path.exists(default_path):
-                 model_path = default_path
+             possible_paths = [
+                 'runs/detect/khmer_text_detector/weights/best.pt',
+                 'best.pt',  # Check current directory
+                 os.path.join(os.path.dirname(__file__), 'best.pt'), # Check package directory
+             ]
+             for p in possible_paths:
+                 if os.path.exists(p):
+                     model_path = p
+                     break
         
         self.model_path = model_path
         
@@ -68,7 +75,7 @@ class TextDetector:
         """Detect text lines."""
         if self.method == 'yolo' and self.yolo_detector:
             try:
-                detections = self.yolo_detector.detect_image(image, show_labels=False)
+                detections = self.yolo_detector.detect_image(image, conf_threshold=self.conf_threshold, show_labels=False)
                 boxes = []
                 padding = self.kwargs.get('padding', 0)
                 
@@ -88,6 +95,7 @@ class TextDetector:
                     boxes.append(TextBox(x, y, w, h, confidence=conf, level=DetectionLevel.LINE))
                 
                 boxes = sorted(boxes, key=lambda b: b.y)
+                boxes = self._merge_overlapping_boxes(boxes)
                 return [b.bbox for b in boxes]
                 
             except Exception as e:
@@ -133,6 +141,44 @@ class TextDetector:
     def detect_all(self, image: Union[str, Path, np.ndarray]) -> List[TextBox]:
         """Detect full hierarchy."""
         return self.legacy_detector.detect_all(image)
+
+    def _merge_overlapping_boxes(self, boxes: List[TextBox], iou_threshold: float = 0.3) -> List[TextBox]:
+        """Merge boxes with high vertical overlap (similar to test_yolo.py logic)."""
+        if not boxes:
+            return []
+        
+        # Sort by y
+        boxes = sorted(boxes, key=lambda b: b.y)
+        merged = []
+        current = boxes[0]
+        
+        for next_box in boxes[1:]:
+            # Calculate vertical overlap
+            y1_curr, y2_curr = current.y, current.y + current.height
+            y1_next, y2_next = next_box.y, next_box.y + next_box.height
+            
+            overlap_y = max(0, min(y2_curr, y2_next) - max(y1_curr, y1_next))
+            min_h = min(current.height, next_box.height)
+            
+            overlap_ratio = overlap_y / min_h if min_h > 0 else 0
+            
+            if overlap_ratio > iou_threshold:
+                # Merge
+                x1 = min(current.x, next_box.x)
+                y1 = min(current.y, next_box.y)
+                x2 = max(current.x + current.width, next_box.x + next_box.width)
+                y2 = max(current.y + current.height, next_box.y + next_box.height)
+                
+                # Average confidence
+                conf = (current.confidence + next_box.confidence) / 2
+                
+                current = TextBox(x1, y1, x2 - x1, y2 - y1, confidence=conf, level=current.level)
+            else:
+                merged.append(current)
+                current = next_box
+                
+        merged.append(current)
+        return merged
 
     def is_multiline(self, image: Union[str, Path, np.ndarray], threshold: int = 2) -> bool:
         """Check if image contains multiple text lines."""

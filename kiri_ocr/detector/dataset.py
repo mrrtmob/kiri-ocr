@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 import argparse
 from tqdm import tqdm
+import concurrent.futures
 
 try:
     from ..generator import FontManager
@@ -13,6 +14,17 @@ except ImportError:
         from kiri_ocr.generator import FontManager
     except ImportError:
         FontManager = None
+
+# Global worker instance for multiprocessing
+_worker_instance = None
+
+def _init_worker(output_dir, fonts_dir):
+    global _worker_instance
+    _worker_instance = DetectorDatasetGenerator(output_dir, fonts_dir)
+
+def _process_wrapper(args):
+    texts, image_idx, split, kwargs = args
+    return _worker_instance.generate_single_image(texts, image_idx, split, **kwargs)
 
 class DetectorDatasetGenerator:
     def __init__(self, output_dir='detector_dataset', fonts_dir='fonts'):
@@ -175,9 +187,11 @@ class DetectorDatasetGenerator:
                               min_words_per_line=2, max_words_per_line=5):
         """Generate realistic document-style layout with paragraphs and tight line spacing"""
         
-        # Image dimensions (more document-like)
-        img_width = random.randint(800, 1200)
-        img_height = random.randint(800, 1400)
+        # Image dimensions (Standard A4-ish ratio)
+        # A4 is 210x297mm (1:1.414)
+        base_width = random.randint(900, 1200)
+        img_width = base_width
+        img_height = int(base_width * random.uniform(1.3, 1.5))
         
         # Create image
         bg_color = self.get_random_background_color()
@@ -207,19 +221,29 @@ class DetectorDatasetGenerator:
             available_font_paths = list(set([f[0] for f in self.font_manager.all_fonts]))
         
         # Select ONE font size for the entire document (realistic)
-        document_font_size = random.randint(32, 48)
+        document_font_size = random.randint(28, 42) # Slightly smaller for more text density
         
         successful_lines = 0
         current_paragraph_lines = 0
-        paragraph_size = random.randint(2, 5)  # Lines per paragraph
+        paragraph_size = random.randint(4, 10)  # Larger paragraphs
         
         while successful_lines < num_lines and y_offset < img_height - 100:
+            # Determine if heading (start of page or random new section)
+            is_heading = False
+            if successful_lines == 0 or (current_paragraph_lines == 0 and random.random() < 0.15):
+                is_heading = True
+
             # Create line with multiple words
-            num_words = random.randint(min_words_per_line, max_words_per_line)
+            if is_heading:
+                 # Headings are shorter
+                 num_words = random.randint(1, 3)
+            else:
+                 num_words = random.randint(min_words_per_line, max_words_per_line)
+            
             line_texts = random.sample(texts, min(num_words, len(texts)))
             
-            # Use document font size
-            font_size = document_font_size
+            # Font size
+            font_size = int(document_font_size * 1.5) if is_heading else document_font_size
             font = None
             
             # Try specific font
@@ -249,8 +273,11 @@ class DetectorDatasetGenerator:
             if font is None:
                 font = ImageFont.load_default()
             
-            # Document-style alignment (mostly left-aligned)
-            align_choice = random.choices(['left', 'justified', 'center'], weights=[70, 25, 5])[0]
+            # Document-style alignment
+            if is_heading:
+                 align_choice = random.choice(['left', 'center'])
+            else:
+                 align_choice = random.choices(['left', 'justified', 'center'], weights=[80, 15, 5])[0]
             
             # Pre-measure the line
             temp_x = x_margin
@@ -318,23 +345,25 @@ class DetectorDatasetGenerator:
                 current_paragraph_lines += 1
             
             # REALISTIC DOCUMENT LINE SPACING
-            # Calculate line-height based on text height
-            base_line_height = int(total_height * random.uniform(1.2, 1.5))  # Standard line-height
-            
-            # Check if we should start a new paragraph
-            if current_paragraph_lines >= paragraph_size:
-                # Paragraph break: add extra spacing
-                paragraph_spacing = random.randint(8, 16)
-                y_offset = y2 + paragraph_spacing
-                
-                # Reset paragraph tracking
-                current_paragraph_lines = 0
-                paragraph_size = random.randint(2, 5)
+            if is_heading:
+                 # Large space after heading
+                 y_offset = y2 + random.randint(20, 40)
+                 current_paragraph_lines = 0 # Headings start new section
+                 paragraph_size = random.randint(4, 10)
             else:
-                # Within paragraph: tight spacing (realistic document)
-                # This creates the effect where 2 lines might be detected as 1
-                within_para_spacing = random.randint(2, 8)  # Very tight! 
-                y_offset = y2 + within_para_spacing
+                # Check if we should start a new paragraph
+                if current_paragraph_lines >= paragraph_size:
+                    # Paragraph break: add extra spacing
+                    paragraph_spacing = random.randint(15, 25)
+                    y_offset = y2 + paragraph_spacing
+                    
+                    # Reset paragraph tracking
+                    current_paragraph_lines = 0
+                    paragraph_size = random.randint(4, 10)
+                else:
+                    # Within paragraph: tight spacing (realistic document)
+                    within_para_spacing = random.randint(5, 12)
+                    y_offset = y2 + within_para_spacing
         
         # Apply augmentation
         if augment:
@@ -357,9 +386,9 @@ class DetectorDatasetGenerator:
         
         return len(annotations)
     
-    def generate_dataset(self, text_file, font_path=None, num_train=800, num_val=200, 
-                         min_lines=5, max_lines=15, min_words_per_line=2, 
-                         max_words_per_line=5, augment=True):
+    def generate_dataset(self, text_file, font_path=None, num_train=800, num_val=200,
+                         min_lines=5, max_lines=15, min_words_per_line=2,
+                         max_words_per_line=5, augment=True, workers=1):
         """Generate complete dataset with realistic document formatting"""
         print("Loading text file...")
         texts = self.load_text(text_file)
@@ -376,36 +405,62 @@ class DetectorDatasetGenerator:
         print(f"  • Within-paragraph spacing: 2-8px (tight)")
         print(f"  • Between-paragraph spacing: 20-40px")
         print(f"  • Augmentation: {augment}")
+        print(f"  • Workers: {workers}")
         
         total_boxes = 0
         
+        # Common args
+        common_kwargs = {
+            'min_lines': min_lines,
+            'max_lines': max_lines,
+            'specific_font_path': font_path,
+            'min_words_per_line': min_words_per_line,
+            'max_words_per_line': max_words_per_line
+        }
+
         # Generate Training
         print(f"\nGenerating {num_train} training images...")
-        for i in tqdm(range(num_train), desc="Training Set", unit="img"):
-            boxes = self.generate_single_image(
-                texts, i, 'train', 
-                min_lines=min_lines, 
-                max_lines=max_lines, 
-                augment=augment,
-                specific_font_path=font_path,
-                min_words_per_line=min_words_per_line,
-                max_words_per_line=max_words_per_line
-            )
-            total_boxes += boxes
+        if workers > 1:
+            tasks = []
+            for i in range(num_train):
+                kwargs = common_kwargs.copy()
+                kwargs['augment'] = augment
+                tasks.append((texts, i, 'train', kwargs))
+            
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(self.output_dir, self.fonts_dir)) as executor:
+                results = list(tqdm(executor.map(_process_wrapper, tasks), total=num_train, desc="Training Set", unit="img"))
+                total_boxes += sum(results)
+        else:
+            for i in tqdm(range(num_train), desc="Training Set", unit="img"):
+                boxes = self.generate_single_image(
+                    texts, i, 'train',
+                    augment=augment,
+                    **common_kwargs
+                )
+                total_boxes += boxes
         
         # Generate Validation
         print(f"\nGenerating {num_val} validation images...")
-        for i in tqdm(range(num_val), desc="Validation Set", unit="img"):
-            boxes = self.generate_single_image(
-                texts, i, 'val', 
-                min_lines=min_lines, 
-                max_lines=max_lines, 
-                augment=False,
-                specific_font_path=font_path,
-                min_words_per_line=min_words_per_line,
-                max_words_per_line=max_words_per_line
-            )
-            total_boxes += boxes
+        if workers > 1:
+            tasks = []
+            for i in range(num_val):
+                kwargs = common_kwargs.copy()
+                kwargs['augment'] = False
+                tasks.append((texts, i, 'val', kwargs))
+            
+            # Re-use executor? No, context manager closed it. Creating new one is fine.
+            # We could wrap both in one executor but that's fine.
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(self.output_dir, self.fonts_dir)) as executor:
+                results = list(tqdm(executor.map(_process_wrapper, tasks), total=num_val, desc="Validation Set", unit="img"))
+                total_boxes += sum(results)
+        else:
+            for i in tqdm(range(num_val), desc="Validation Set", unit="img"):
+                boxes = self.generate_single_image(
+                    texts, i, 'val',
+                    augment=False,
+                    **common_kwargs
+                )
+                total_boxes += boxes
         
         # Create YAML
         yaml_content = f"""# Khmer Text Line Detection Dataset (Document-Style)
@@ -474,5 +529,6 @@ def generate_detector_dataset_command(args):
         max_lines=args.max_lines,
         min_words_per_line=min_words,
         max_words_per_line=max_words,
-        augment=not args.no_augment
+        augment=not args.no_augment,
+        workers=args.workers
     )
