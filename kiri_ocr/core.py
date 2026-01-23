@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 
 from .model import LightweightOCR, CharacterSet
+from .model_transformer import HybridContextOCRV2, CFG, CharTokenizer, beam_decode_one_batched, preprocess_pil
 
 class OCR:
     """Complete Document OCR System with Padding"""
@@ -16,6 +17,7 @@ class OCR:
 
     def __init__(self, model_path='mrrtmob/kiri-ocr',
                  det_model_path=None,
+                 det_method='craft',
                  det_conf_threshold=0.5,
                  charset_path='models/charset_lite.txt',
                  language='mixed',
@@ -38,7 +40,11 @@ class OCR:
         self.language = language
         self.padding = padding
         self.det_model_path = det_model_path
+        self.det_method = det_method
         self.det_conf_threshold = det_conf_threshold
+        self.is_transformer = False
+        self.transformer_cfg = None
+        self.transformer_tok = None
         
         # Resolve model path
         model_file = Path(model_path)
@@ -103,41 +109,102 @@ class OCR:
             try:
                 checkpoint = torch.load(model_path, map_location=device, weights_only=False)
                 
-                # Load charset
-                if 'charset' in checkpoint:
+                # CHECK FOR TRANSFORMER MODEL
+                is_transformer_detected = False
+                state_dict = None
+                vocab_path_candidate = None
+
+                if isinstance(checkpoint, dict):
+                    if 'config' in checkpoint and 'vocab_path' in checkpoint:
+                        is_transformer_detected = True
+                        state_dict = checkpoint['model']
+                        self.transformer_cfg = checkpoint['config']
+                        vocab_path_candidate = checkpoint['vocab_path']
+                    # Check for raw state dict of transformer (look for specific layer names)
+                    elif any(k.startswith('stem.') or k.startswith('enc.') for k in checkpoint.keys()):
+                        is_transformer_detected = True
+                        state_dict = checkpoint
+                        self.transformer_cfg = CFG() # Default config
+                        
+                        # Try to find vocab file nearby
+                        possible_vocabs = [
+                            model_file.parent / "vocab_auto.json",
+                            model_file.parent / "vocab_char.json"
+                        ]
+                        for p in possible_vocabs:
+                            if p.exists():
+                                vocab_path_candidate = str(p)
+                                break
+                        
+                        if not vocab_path_candidate:
+                             vocab_path_candidate = str(model_file.parent / "vocab_auto.json")
+
+                if is_transformer_detected:
                     if self.verbose:
-                        print(f"  ✓ Found embedded charset ({len(checkpoint['charset'])} chars)")
-                    self.charset = CharacterSet.from_checkpoint(checkpoint)
+                        print(f"  ✓ Detected Transformer Model")
+                    
+                    self.is_transformer = True
+                    
+                    # Handle vocab path validation
+                    vocab_p = Path(vocab_path_candidate)
+                    if not vocab_p.exists():
+                         # Try looking in same dir as model
+                         vocab_p = model_file.parent / vocab_p.name
+                    
+                    if not vocab_p.exists():
+                         # Try fallback name in model dir
+                         vocab_p = model_file.parent / "vocab_auto.json"
+
+                    if not vocab_p.exists():
+                         raise FileNotFoundError(f"Could not find vocabulary file for transformer model. Expected at: {vocab_path_candidate} or nearby.")
+
+                    self.transformer_tok = CharTokenizer(str(vocab_p), self.transformer_cfg)
+                    self.model = HybridContextOCRV2(self.transformer_cfg, self.transformer_tok).to(device)
+                    self.model.load_state_dict(state_dict, strict=True)
+                    self.model.eval()
+                    if self.transformer_cfg.USE_FP16 and device == 'cuda':
+                        self.model.half()
+                        
+                    OCR._model_cache[cache_key] = (self.model, self.transformer_tok)
+                    if self.verbose:
+                        print(f"✓ Transformer Model loaded (Vocab: {self.transformer_tok.vocab_size})")
+
                 else:
-                    # Fallback to charset file
-                    if not Path(charset_path).exists():
-                        # Try looking in package directory if not found locally
-                        pkg_dir = Path(__file__).parent
-                        if (pkg_dir / charset_path).exists():
-                            charset_path = str(pkg_dir / charset_path)
+                    # Load charset
+                    if 'charset' in checkpoint:
+                        if self.verbose:
+                            print(f"  ✓ Found embedded charset ({len(checkpoint['charset'])} chars)")
+                        self.charset = CharacterSet.from_checkpoint(checkpoint)
+                    else:
+                        # Fallback to charset file
+                        if not Path(charset_path).exists():
+                            # Try looking in package directory if not found locally
+                            pkg_dir = Path(__file__).parent
+                            if (pkg_dir / charset_path).exists():
+                                charset_path = str(pkg_dir / charset_path)
+                        
+                        if self.verbose:
+                            print(f"  ℹ️ Loading charset from file: {charset_path}")
+                        self.charset = CharacterSet.load(charset_path)
+                    
+                    # Initialize model
+                    self.model = LightweightOCR(num_chars=len(self.charset)).eval()
+                    
+                    # Load weights
+                    if 'model_state_dict' in checkpoint:
+                        self.model.load_state_dict(checkpoint['model_state_dict'])
+                    else:
+                        # Assume checkpoint IS state_dict (legacy/raw save)
+                        self.model.load_state_dict(checkpoint)
+                    
+                    self.model = self.model.to(device)
+                    
+                    # Update cache
+                    OCR._model_cache[cache_key] = (self.model, self.charset)
                     
                     if self.verbose:
-                        print(f"  ℹ️ Loading charset from file: {charset_path}")
-                    self.charset = CharacterSet.load(charset_path)
-                
-                # Initialize model
-                self.model = LightweightOCR(num_chars=len(self.charset)).eval()
-                
-                # Load weights
-                if 'model_state_dict' in checkpoint:
-                    self.model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    # Assume checkpoint IS state_dict (legacy/raw save)
-                    self.model.load_state_dict(checkpoint)
-                
-                self.model = self.model.to(device)
-                
-                # Update cache
-                OCR._model_cache[cache_key] = (self.model, self.charset)
-                
-                if self.verbose:
-                    print(f"✓ Model loaded ({len(self.charset)} characters)")
-                    print(f"✓ Box padding: {padding}px")
+                        print(f"✓ Model loaded ({len(self.charset)} characters)")
+                        print(f"✓ Box padding: {padding}px")
 
             except RuntimeError as e:
                 if "size mismatch" in str(e):
@@ -161,6 +228,7 @@ class OCR:
         if self._detector is None:
             from .detector import TextDetector
             self._detector = TextDetector(
+                method=self.det_method,
                 model_path=self.det_model_path,
                 conf_threshold=self.det_conf_threshold
             )
@@ -197,22 +265,27 @@ class OCR:
         # Convert to PIL
         roi_pil = Image.fromarray(roi).convert('L')
         
-        # Resize maintaining aspect ratio
-        orig_w, orig_h = roi_pil.size
-        new_h = 32
-        new_w = int((orig_w / orig_h) * new_h)
-        
-        # Ensure minimum width
-        if new_w < 32:
-            new_w = 32
-        
-        roi_pil = roi_pil.resize((new_w, new_h), Image.LANCZOS)
-        
-        # Normalize
-        roi_array = np.array(roi_pil) / 255.0
-        roi_tensor = torch.tensor(roi_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        
-        return roi_tensor
+        if self.is_transformer:
+            # Transformer preprocessing
+            return preprocess_pil(self.transformer_cfg, roi_pil)
+        else:
+            # Legacy preprocessing
+            # Resize maintaining aspect ratio
+            orig_w, orig_h = roi_pil.size
+            new_h = 32
+            new_w = int((orig_w / orig_h) * new_h)
+            
+            # Ensure minimum width
+            if new_w < 32:
+                new_w = 32
+            
+            roi_pil = roi_pil.resize((new_w, new_h), Image.LANCZOS)
+            
+            # Normalize
+            roi_array = np.array(roi_pil) / 255.0
+            roi_tensor = torch.tensor(roi_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            
+            return roi_tensor
     
     def recognize_single_line_image(self, image_path):
         """Recognize text from a single line image without detection"""
@@ -221,7 +294,6 @@ class OCR:
             raise ValueError(f"Could not load image: {image_path}")
             
         # Preprocess
-        # We need to resize height to 32 and keep aspect ratio
         if len(img.shape) == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
@@ -230,14 +302,18 @@ class OCR:
              img = 255 - img
 
         img_pil = Image.fromarray(img)
-        w, h = img_pil.size
-        new_h = 32
-        new_w = int((w / h) * new_h)
-        if new_w < 32: new_w = 32
-        
-        img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
-        img_array = np.array(img_pil) / 255.0
-        img_tensor = torch.tensor(img_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+        if self.is_transformer:
+            img_tensor = preprocess_pil(self.transformer_cfg, img_pil)
+        else:
+            w, h = img_pil.size
+            new_h = 32
+            new_w = int((w / h) * new_h)
+            if new_w < 32: new_w = 32
+            
+            img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
+            img_array = np.array(img_pil) / 255.0
+            img_tensor = torch.tensor(img_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
         
         text, confidence = self.recognize_region(img_tensor)
         return text, confidence
@@ -246,6 +322,20 @@ class OCR:
         """Recognize text in a single region"""
         image_tensor = image_tensor.to(self.device)
         
+        if self.is_transformer:
+            if self.transformer_cfg.USE_FP16 and self.device == 'cuda':
+                image_tensor = image_tensor.half()
+            
+            # Encoder
+            mem = self.model.encode(image_tensor)
+            mem_proj = self.model.mem_proj(mem)
+            ctc_logits = self.model.ctc_head(mem) if self.transformer_cfg.USE_CTC else None
+            
+            text = beam_decode_one_batched(self.model, mem_proj, self.transformer_tok, self.transformer_cfg, ctc_logits_1=ctc_logits)
+            # Todo: Estimate confidence for transformer?
+            confidence = 1.0
+            return text, confidence
+
         with torch.no_grad():
             logits = self.model(image_tensor)
             

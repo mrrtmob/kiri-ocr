@@ -17,12 +17,18 @@ try:
 except ImportError:
     CRAFTDetector = None
 
+# Import DB detector
+try:
+    from .db import DBDetector
+except ImportError:
+    DBDetector = None
+
 # Legacy YOLO support (removed)
 YOLOTextDetector = None
 
 class TextDetector:
     """
-    Unified Text Detector that supports both CRAFT-based and classic computer vision approaches.
+    Unified Text Detector that supports CRAFT-based, DB-based and classic computer vision approaches.
     Defaults to CRAFT if available, otherwise falls back to classic.
     """
     
@@ -31,22 +37,32 @@ class TextDetector:
         Initialize the TextDetector.
         
         Args:
-            method: 'craft' or 'legacy' (classic CV)
-            model_path: Path to CRAFT model (optional)
-            **kwargs: Arguments passed to ImageProcessingTextDetector
+            method: 'craft', 'db', or 'legacy' (classic CV)
+            model_path: Path to model (optional)
+            **kwargs: Arguments passed to detector
         """
         self.conf_threshold = kwargs.pop('conf_threshold', 0.25)
         self.method = method
         self.kwargs = kwargs
         self.craft_detector = None
+        self.db_detector = None
         
         # Try to resolve model path if not provided
         if model_path is None:
-             possible_paths = [
-                 'runs/detect/khmer_text_detector/weights/best.pth',
-                 'best.pth',  # Check current directory
-                 os.path.join(os.path.dirname(__file__), 'best.pth'), # Check package directory
-             ]
+             possible_paths = []
+             if self.method == 'db':
+                 possible_paths = [
+                     'DB_TD500_resnet50.onnx',
+                     os.path.join(os.path.dirname(__file__), 'DB_TD500_resnet50.onnx'),
+                     'DB_IC15_resnet18.onnx',
+                 ]
+             else: # CRAFT
+                 possible_paths = [
+                     'runs/detect/khmer_text_detector/weights/best.pth',
+                     'best.pth',  # Check current directory
+                     os.path.join(os.path.dirname(__file__), 'best.pth'), # Check package directory
+                 ]
+                 
              for p in possible_paths:
                  if os.path.exists(p):
                      model_path = p
@@ -54,7 +70,7 @@ class TextDetector:
         
         self.model_path = model_path
         
-        # Initialize CRAFT if requested
+        # Initialize Detector based on method
         if self.method == 'craft':
              if CRAFTDetector is None:
                  warnings.warn("CRAFT detector not available. Falling back to legacy.")
@@ -69,6 +85,27 @@ class TextDetector:
                          print(f"Warning: CRAFT model path not found: {self.model_path}")
                  except Exception as e:
                      print(f"Error loading CRAFT detector: {e}. Falling back to legacy.")
+                     self.method = 'legacy'
+                     
+        elif self.method == 'db':
+             if DBDetector is None:
+                 warnings.warn("DB detector not available. Falling back to legacy.")
+                 self.method = 'legacy'
+             else:
+                 try:
+                     if self.model_path and os.path.exists(self.model_path):
+                         # Extract DB specific kwargs
+                         db_kwargs = {k: v for k, v in self.kwargs.items() if k in [
+                             'input_size', 'binary_threshold', 'polygon_threshold',
+                             'max_candidates', 'unclip_ratio', 'padding_pct', 'padding_px',
+                             'padding_y_pct', 'padding_y_px'
+                         ]}
+                         self.db_detector = DBDetector(self.model_path, **db_kwargs)
+                     else:
+                         print(f"Warning: DB model path not found: {self.model_path}")
+                         self.method = 'legacy'
+                 except Exception as e:
+                     print(f"Error loading DB detector: {e}. Falling back to legacy.")
                      self.method = 'legacy'
         
         # Always initialize legacy detector as fallback/helper
@@ -88,43 +125,56 @@ class TextDetector:
                     # For now, fallback or temporary save
                     warnings.warn("CRAFT detector currently requires file path. Falling back to legacy.")
                     return self.legacy_detector.detect_lines(image)
-
-                boxes = []
-                padding = self.kwargs.get('padding', 0)
                 
-                for box in detected_boxes:
-                    # Handle CRAFT polygon output (4, 2)
-                    if hasattr(box, 'shape') and box.shape == (4, 2):
-                        x_min = np.min(box[:, 0])
-                        y_min = np.min(box[:, 1])
-                        x_max = np.max(box[:, 0])
-                        y_max = np.max(box[:, 1])
-                        x1, y1, x2, y2 = x_min, y_min, x_max, y_max
-                    else:
-                        x1, y1, x2, y2 = box
-                        
-                    w = x2 - x1
-                    h = y2 - y1
-                    
-                    # Apply padding
-                    if padding:
-                         x1 = max(0, x1 - padding)
-                         y1 = max(0, y1 - padding)
-                         w += 2 * padding
-                         h += 2 * padding
-                    
-                    # Confidence is not returned by simple detect_text, assume 1.0 or extract if possible
-                    boxes.append(TextBox(int(x1), int(y1), int(w), int(h), confidence=1.0, level=DetectionLevel.LINE))
-                
-                boxes = sorted(boxes, key=lambda b: b.y)
-                boxes = self._merge_overlapping_boxes(boxes)
-                return [b.bbox for b in boxes]
+                return self._process_boxes(detected_boxes)
                 
             except Exception as e:
                 print(f"CRAFT detection failed: {e}. Falling back to legacy.")
                 return self.legacy_detector.detect_lines(image)
+
+        elif self.method == 'db' and self.db_detector:
+            try:
+                detected_boxes = self.db_detector.detect_text(image)
+                return self._process_boxes(detected_boxes, merge=False)
+            except Exception as e:
+                print(f"DB detection failed: {e}. Falling back to legacy.")
+                return self.legacy_detector.detect_lines(image)
         
         return self.legacy_detector.detect_lines(image)
+
+    def _process_boxes(self, detected_boxes, merge=True):
+        """Convert polygons to TextBoxes."""
+        boxes = []
+        padding = self.kwargs.get('padding', 0)
+        
+        for box in detected_boxes:
+            # Handle polygon output (4, 2)
+            if hasattr(box, 'shape') and box.shape == (4, 2):
+                x_min = np.min(box[:, 0])
+                y_min = np.min(box[:, 1])
+                x_max = np.max(box[:, 0])
+                y_max = np.max(box[:, 1])
+                x1, y1, x2, y2 = x_min, y_min, x_max, y_max
+            else:
+                x1, y1, x2, y2 = box
+                
+            w = x2 - x1
+            h = y2 - y1
+            
+            # Apply padding
+            if padding:
+                    x1 = max(0, x1 - padding)
+                    y1 = max(0, y1 - padding)
+                    w += 2 * padding
+                    h += 2 * padding
+            
+            # Confidence is not returned by simple detect_text, assume 1.0 or extract if possible
+            boxes.append(TextBox(int(x1), int(y1), int(w), int(h), confidence=1.0, level=DetectionLevel.LINE))
+        
+        boxes = sorted(boxes, key=lambda b: b.y)
+        if merge:
+            boxes = self._merge_overlapping_boxes(boxes)
+        return [b.bbox for b in boxes]
 
     def detect_words(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[int, int, int, int]]:
         """Detect words."""
@@ -134,8 +184,8 @@ class TextDetector:
         
     def detect_blocks(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[int, int, int, int]]:
         """Detect text blocks."""
-        if self.method == 'craft' and self.craft_detector:
-             # Get lines using CRAFT
+        if (self.method == 'craft' and self.craft_detector) or (self.method == 'db' and self.db_detector):
+             # Get lines using CRAFT or DB
              lines_bbox = self.detect_lines(image)
              
              # Convert back to TextBox for grouping
