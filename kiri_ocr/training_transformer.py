@@ -282,7 +282,7 @@ def train_command(args):
     if args.from_model and os.path.exists(args.from_model):
         print(f"  🔄 Loading weights from {args.from_model}")
         try:
-            ckpt = torch.load(args.from_model, map_location='cpu')
+            ckpt = torch.load(args.from_model, map_location='cpu', weights_only=False)
             state_dict = ckpt['model'] if 'model' in ckpt else ckpt
             model.load_state_dict(state_dict, strict=False)
             print("  ✓ Weights loaded (strict=False)")
@@ -342,7 +342,8 @@ def train_command(args):
     if args.resume and os.path.exists(resume_path):
         print(f"  🔄 Resuming from {resume_path}...")
         try:
-            ckpt = torch.load(resume_path, map_location=device)
+            # weights_only=False required because we pickle the CFG object
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
             # Load model state
             if 'model' in ckpt:
                 model.load_state_dict(ckpt['model'], strict=False)
