@@ -10,8 +10,8 @@ import numpy as np
 from torchvision import transforms
 from PIL import Image, ImageOps
 
-@dataclass
 class CFG:
+    # --- Model Architecture ---
     IMG_H: int = 48
     IMG_W: int = 640
     MAX_DEC_LEN: int = 260
@@ -29,23 +29,41 @@ class CFG:
     DEC_HEADS: int = 8
     DEC_FF: int = 1024
     USE_CTC: bool = True
-    CTC_FUSION_ALPHA: float = 0.35
     USE_LM: bool = True
     USE_LM_FUSION_EVAL: bool = True
     LM_FUSION_ALPHA: float = 0.35
     USE_FP16: bool = True
     USE_AUTOCAST: bool = True
 
-    # Inference params
-    BEAM: int = 6
-    BEAM_LENP: float = 0.75
-    EOS_LOGP_BIAS: float = 0.55
-    EOS_LOGP_BOOST: float = 0.65
-    EOS_BIAS_UNTIL_LEN: int = 28
-    DEC_MAX_LEN_RATIO: float = 1.35
+    # --- Inference Params (STRICT MODE) ---
+    
+    # 1. High CTC Fusion
+    # Forces the decoder to respect the visual boundaries found by CTC.
+    # CTC usually outputs blanks after the word, so this kills the repetition.
+    CTC_FUSION_ALPHA: float = 0.8  
+
+    # 2. Narrow Beam
+    # Reducing from 6 to 2 prevents the model from "overthinking" 
+    # and finding weird long paths like "CONTAIN CON".
+    BEAM: int = 2
+    
+    # 3. No Length Bonus
+    # Keep at 0.0. Any positive number rewards longer text (like adding " CON").
+    BEAM_LENP: float = 0.0
+
+    # 4. Aggressive Stopping
+    # Massive bias to force the End-Of-Sentence token.
+    EOS_LOGP_BIAS: float = 10.0
+    EOS_LOGP_BOOST: float = 10.0
+    EOS_BIAS_UNTIL_LEN: int = 1
+
+    # 5. Anti-Loop
+    REPEAT_LAST_PENALTY: float = 5.0
+
+    # Misc
+    DEC_MAX_LEN_RATIO: float = 1.2
     DEC_MAX_LEN_PAD: int = 6
     MEM_MAX_LEN_RATIO: float = 0.75
-    REPEAT_LAST_PENALTY: float = 1.0
     UNK_LOGP_PENALTY: float = 1.0
 
 class CharTokenizer:
