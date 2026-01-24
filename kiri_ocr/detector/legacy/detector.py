@@ -1,62 +1,22 @@
+"""
+Legacy Text Detector using Classic Computer Vision.
+
+This module provides text detection using traditional image processing
+techniques for environments without deep learning dependencies.
+"""
 import cv2
 import numpy as np
-from dataclasses import dataclass, field
+import os
 from typing import List, Tuple, Optional, Dict, Union
-from enum import Enum
 from pathlib import Path
 import warnings
 
-
-class DetectionLevel(Enum):
-    """Detection granularity levels"""
-    BLOCK = "block"
-    PARAGRAPH = "paragraph"
-    LINE = "line"
-    WORD = "word"
-    CHARACTER = "character"
+from ..base import TextBox, DetectionLevel
 
 
-@dataclass
-class TextBox:
-    """Represents a detected text region with metadata"""
-    x: int
-    y: int
-    width: int
-    height: int
-    confidence: float = 1.0
-    level: DetectionLevel = DetectionLevel.LINE
-    children: List['TextBox'] = field(default_factory=list)
-    
-    @property
-    def bbox(self) -> Tuple[int, int, int, int]:
-        """Return (x, y, w, h) tuple"""
-        return (self.x, self.y, self.width, self.height)
-    
-    @property
-    def xyxy(self) -> Tuple[int, int, int, int]:
-        """Return (x1, y1, x2, y2) tuple"""
-        return (self.x, self.y, self.x + self.width, self.y + self.height)
-    
-    @property
-    def area(self) -> int:
-        return self.width * self.height
-    
-    @property
-    def center(self) -> Tuple[float, float]:
-        return (self.x + self.width / 2, self.y + self.height / 2)
-    
-    @property
-    def baseline_y(self) -> float:
-        """Approximate baseline (bottom - 20% of height)"""
-        return self.y + self.height * 0.8
-    
-    def __repr__(self):
-        return f"TextBox({self.x}, {self.y}, {self.width}, {self.height}, conf={self.confidence:.2f})"
-
-
-class TextDetector:
+class ImageProcessingTextDetector:
     """
-    Advanced Text Detector.
+    Advanced Text Detector (Classic Computer Vision Approach).
     
     Detects text regions robustly across ALL background/text color conditions
     using multiple detection strategies:
@@ -69,7 +29,7 @@ class TextDetector:
     6. Projection profile analysis for line segmentation
     
     Example:
-        detector = TextDetector()
+        detector = ImageProcessingTextDetector()
         lines = detector.detect_lines("image.png")
         words = detector.detect_words("image.png")
         hierarchy = detector.detect_all("image.png")  # Full hierarchy
@@ -89,7 +49,7 @@ class TextDetector:
         debug: bool = False
     ):
         """
-        Initialize the TextDetector.
+        Initialize the ImageProcessingTextDetector.
         
         Args:
             padding: Pixels to add around detected boxes (None = auto-calculate)
@@ -1136,23 +1096,3 @@ class TextDetector:
         px, py = point
         x, y, w, h = bbox
         return x <= px <= x + w and y <= py <= y + h
-
-
-# ==================== CONVENIENCE FUNCTIONS ====================
-
-def detect_text_lines(image: Union[str, Path, np.ndarray], **kwargs) -> List[Tuple[int, int, int, int]]:
-    """Convenience function to detect text lines."""
-    detector = TextDetector(**kwargs)
-    return detector.detect_lines(image)
-
-
-def detect_text_words(image: Union[str, Path, np.ndarray], **kwargs) -> List[Tuple[int, int, int, int]]:
-    """Convenience function to detect text words."""
-    detector = TextDetector(**kwargs)
-    return detector.detect_words(image)
-
-
-def detect_text_blocks(image: Union[str, Path, np.ndarray], **kwargs) -> List[Tuple[int, int, int, int]]:
-    """Convenience function to detect text blocks."""
-    detector = TextDetector(**kwargs)
-    return detector.detect_blocks(image)
