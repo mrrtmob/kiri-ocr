@@ -112,7 +112,12 @@ class TextDetector:
         self.legacy_detector = ImageProcessingTextDetector(**kwargs)
 
     def detect_lines(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[int, int, int, int]]:
-        """Detect text lines."""
+        """Detect text lines. Returns bboxes only."""
+        boxes = self.detect_lines_objects(image)
+        return [b.bbox for b in boxes]
+
+    def detect_lines_objects(self, image: Union[str, Path, np.ndarray]) -> List[TextBox]:
+        """Detect text lines. Returns TextBox objects (bbox + confidence)."""
         if self.method == 'craft' and self.craft_detector:
             try:
                 # CRAFT returns list of boxes (x1, y1, x2, y2)
@@ -124,30 +129,49 @@ class TextDetector:
                     # TODO: Support direct numpy array in CRAFTDetector.detect_text
                     # For now, fallback or temporary save
                     warnings.warn("CRAFT detector currently requires file path. Falling back to legacy.")
-                    return self.legacy_detector.detect_lines(image)
+                    # Legacy fallback
+                    return self._wrap_legacy(self.legacy_detector.detect_lines(image))
                 
-                return self._process_boxes(detected_boxes)
+                return self._process_boxes_objects(detected_boxes, merge=True)
                 
             except Exception as e:
                 print(f"CRAFT detection failed: {e}. Falling back to legacy.")
-                return self.legacy_detector.detect_lines(image)
+                return self._wrap_legacy(self.legacy_detector.detect_lines(image))
 
         elif self.method == 'db' and self.db_detector:
             try:
                 detected_boxes = self.db_detector.detect_text(image)
-                return self._process_boxes(detected_boxes, merge=False)
+                # _process_boxes returns [bbox]. I need to change it.
+                # I'll create a new method _process_boxes_objects
+                return self._process_boxes_objects(detected_boxes, merge=False)
             except Exception as e:
                 print(f"DB detection failed: {e}. Falling back to legacy.")
-                return self.legacy_detector.detect_lines(image)
+                return self._wrap_legacy(self.legacy_detector.detect_lines(image))
         
-        return self.legacy_detector.detect_lines(image)
+        return self._wrap_legacy(self.legacy_detector.detect_lines(image))
+
+    def _wrap_legacy(self, bboxes):
+        return [TextBox(x, y, w, h, confidence=1.0, level=DetectionLevel.LINE) for (x, y, w, h) in bboxes]
 
     def _process_boxes(self, detected_boxes, merge=True):
-        """Convert polygons to TextBoxes."""
+        """Convert polygons to TextBoxes (returns bboxes)."""
+        boxes = self._process_boxes_objects(detected_boxes, merge=merge)
+        return [b.bbox for b in boxes]
+
+    def _process_boxes_objects(self, detected_boxes, merge=True) -> List[TextBox]:
+        """Convert polygons to TextBoxes (returns objects)."""
         boxes = []
         padding = self.kwargs.get('padding', 0)
         
-        for box in detected_boxes:
+        for item in detected_boxes:
+            # Handle (box, confidence) tuple from DB
+            if isinstance(item, tuple) and len(item) == 2:
+                 # Check if second item is float-like (confidence)
+                 box, confidence = item
+            else:
+                 box = item
+                 confidence = 1.0
+
             # Handle polygon output (4, 2)
             if hasattr(box, 'shape') and box.shape == (4, 2):
                 x_min = np.min(box[:, 0])
@@ -168,13 +192,49 @@ class TextDetector:
                     w += 2 * padding
                     h += 2 * padding
             
-            # Confidence is not returned by simple detect_text, assume 1.0 or extract if possible
-            boxes.append(TextBox(int(x1), int(y1), int(w), int(h), confidence=1.0, level=DetectionLevel.LINE))
+            boxes.append(TextBox(int(x1), int(y1), int(w), int(h), confidence=float(confidence), level=DetectionLevel.LINE))
         
-        boxes = sorted(boxes, key=lambda b: b.y)
+        boxes = self._sort_reading_order(boxes)
         if merge:
             boxes = self._merge_overlapping_boxes(boxes)
-        return [b.bbox for b in boxes]
+        return boxes
+
+    def _sort_reading_order(self, boxes: List[TextBox]) -> List[TextBox]:
+        """Sort boxes from top-to-bottom, left-to-right."""
+        if not boxes:
+            return []
+            
+        # Helper to get center y
+        def get_cy(b): return b.y + b.height / 2
+        
+        # Sort initially by Y
+        boxes.sort(key=lambda b: b.y)
+        
+        sorted_boxes = []
+        current_line = [boxes[0]]
+        current_cy = get_cy(boxes[0])
+        
+        for b in boxes[1:]:
+            cy = get_cy(b)
+            # Threshold: half of the height of the current line's average height
+            avg_height = sum(lb.height for lb in current_line) / len(current_line)
+            
+            if abs(cy - current_cy) < avg_height / 2: # Same line
+                current_line.append(b)
+            else:
+                # Sort current line by X
+                current_line.sort(key=lambda b: b.x)
+                sorted_boxes.extend(current_line)
+                
+                # Start new line
+                current_line = [b]
+                current_cy = cy
+                
+        # Flush last line
+        current_line.sort(key=lambda b: b.x)
+        sorted_boxes.extend(current_line)
+        
+        return sorted_boxes
 
     def detect_words(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[int, int, int, int]]:
         """Detect words."""

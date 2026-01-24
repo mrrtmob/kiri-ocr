@@ -56,7 +56,7 @@ class DBDetector:
         self.net.setMaxCandidates(self.max_candidates)
         self.net.setUnclipRatio(self.unclip_ratio)
 
-    def detect_text(self, image: Union[str, Path, np.ndarray]) -> List[np.ndarray]:
+    def detect_text(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[np.ndarray, float]]:
         if isinstance(image, (str, Path)):
             image_cv = cv2.imread(str(image))
             if image_cv is None:
@@ -70,15 +70,51 @@ class DBDetector:
         else:
             raise TypeError("Image must be a path or numpy array")
 
+        # Calculate dynamic size based on the specific image dimensions
+        # This prevents distorting small images while respecting self.input_size as a limit
+        h, w = image_cv.shape[:2]
+        new_w, new_h = self._get_dynamic_size(w, h)
+        
+        # Update the network input size for this specific inference
+        self.net.setInputParams(scale=self.scale, size=(new_w, new_h), mean=self.mean, swapRB=True)
+
         boxes, confidences = self.net.detect(image_cv)
         
-        processed_boxes = []
+        results = []
         if boxes is not None:
-            # Convert to numpy int32
             boxes_np = [np.int32(box) for box in boxes]
-            processed_boxes = self._apply_smart_padding(boxes_np)
+            padded_boxes = self._apply_smart_padding(boxes_np)
+            
+            # Combine with confidences
+            for box, conf in zip(padded_boxes, confidences):
+                 results.append((box, float(conf)))
                 
-        return processed_boxes
+        return results
+
+    def _get_dynamic_size(self, w: int, h: int) -> Tuple[int, int]:
+        """
+        Calculates new dimensions that:
+        1. Fit within self.input_size
+        2. Preserve Aspect Ratio (crucial for small text)
+        3. Are multiples of 32 (required by DBNet)
+        """
+        target_w, target_h = self.input_size
+        
+        # Calculate scale to fit within target bounds
+        scale = min(target_w / w, target_h / h)
+        
+        # If image is very small, we might actually want to scale UP to target_h
+        # But usually, just fitting within bounds is safer.
+        # However, for tiny text (h=32), we ensure it doesn't get crushed.
+        
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+
+        # Align to multiples of 32
+        new_w = max(32, int(round(new_w / 32) * 32))
+        new_h = max(32, int(round(new_h / 32) * 32))
+        
+        return new_w, new_h
 
     def _apply_smart_padding(self, boxes: List[np.ndarray]) -> List[np.ndarray]:
         """

@@ -3,13 +3,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, NamedTuple
 import json
 import math
 import numpy as np
-from torchvision import transforms
-from PIL import Image, ImageOps
+from PIL import Image
 
+
+# ========== CONFIGURATION ==========
+@dataclass
 class CFG:
     # --- Model Architecture ---
     IMG_H: int = 48
@@ -18,16 +20,19 @@ class CFG:
     UNK_TOKEN: str = "<unk>"
     COLLAPSE_WHITESPACE: bool = True
     UNICODE_NFC: bool = True
+
     ENC_DIM: int = 256
     ENC_LAYERS: int = 4
     ENC_HEADS: int = 8
     ENC_FF: int = 1024
     DROPOUT: float = 0.15
+
     USE_DECODER: bool = True
     DEC_DIM: int = 256
     DEC_LAYERS: int = 3
     DEC_HEADS: int = 8
     DEC_FF: int = 1024
+
     USE_CTC: bool = True
     USE_LM: bool = True
     USE_LM_FUSION_EVAL: bool = True
@@ -35,37 +40,34 @@ class CFG:
     USE_FP16: bool = True
     USE_AUTOCAST: bool = True
 
-    # --- Inference Params (STRICT MODE) ---
-    
-    # 1. High CTC Fusion
-    # Forces the decoder to respect the visual boundaries found by CTC.
-    # CTC usually outputs blanks after the word, so this kills the repetition.
-    CTC_FUSION_ALPHA: float = 0.8  
+    # --- Inference Params ---
+    CTC_FUSION_ALPHA: float = 0.5
+    BEAM: int = 4
+    BEAM_LENP: float = 0.6  # FIXED: was 0.0
 
-    # 2. Narrow Beam
-    # Reducing from 6 to 2 prevents the model from "overthinking" 
-    # and finding weird long paths like "CONTAIN CON".
-    BEAM: int = 2
-    
-    # 3. No Length Bonus
-    # Keep at 0.0. Any positive number rewards longer text (like adding " CON").
-    BEAM_LENP: float = 0.0
+    EOS_LOGP_BIAS: float = 5.0
+    EOS_LOGP_BOOST: float = 5.0
+    EOS_BIAS_UNTIL_LEN: int = 3
 
-    # 4. Aggressive Stopping
-    # Massive bias to force the End-Of-Sentence token.
-    EOS_LOGP_BIAS: float = 10.0
-    EOS_LOGP_BOOST: float = 10.0
-    EOS_BIAS_UNTIL_LEN: int = 1
+    REPEAT_LAST_PENALTY: float = 3.0
+    UNK_LOGP_PENALTY: float = 2.0
 
-    # 5. Anti-Loop
-    REPEAT_LAST_PENALTY: float = 5.0
-
-    # Misc
-    DEC_MAX_LEN_RATIO: float = 1.2
-    DEC_MAX_LEN_PAD: int = 6
+    DEC_MAX_LEN_RATIO: float = 1.5
+    DEC_MAX_LEN_PAD: int = 10
     MEM_MAX_LEN_RATIO: float = 0.75
-    UNK_LOGP_PENALTY: float = 1.0
 
+
+# ========== RESULT TYPE ==========
+class OCRResult(NamedTuple):
+    """Structured result from OCR inference"""
+
+    text: str
+    confidence: float
+    ctc_confidence: Optional[float] = None
+    decoder_confidence: Optional[float] = None
+
+
+# ========== TOKENIZER ==========
 class CharTokenizer:
     def __init__(self, vocab_path: str, cfg: CFG):
         with open(vocab_path, "r", encoding="utf-8") as f:
@@ -85,11 +87,29 @@ class CharTokenizer:
         self.ctc_offset = 2
         self.vocab_size = len(self.token_to_id)
         self.ctc_classes = self.vocab_size + self.ctc_offset
+
         self.dec_pad = 0
         self.dec_bos = 1
         self.dec_eos = 2
         self.dec_offset = 3
         self.dec_vocab = self.vocab_size + self.dec_offset
+
+    def decode_ctc(self, ids: List[int]) -> str:
+        """Decode CTC output with deduplication"""
+        chars = []
+        prev_id = None
+        for idx in ids:
+            if idx == prev_id:
+                continue
+            prev_id = idx
+            if idx < self.ctc_offset:
+                continue
+            raw_id = idx - self.ctc_offset
+            if 0 <= raw_id < self.vocab_size:
+                char = self.id_to_token.get(raw_id, "")
+                if char != self.unk_token:
+                    chars.append(char)
+        return "".join(chars)
 
     def decode_dec(self, ids: List[int]) -> str:
         out = []
@@ -102,15 +122,30 @@ class CharTokenizer:
                 out.append("" if t == self.unk_token else t)
         return "".join(out)
 
+    def dec_to_ctc_id(self, dec_id: int) -> int:
+        """Convert decoder token ID to CTC token ID"""
+        if dec_id in (self.dec_pad, self.dec_bos, self.dec_eos):
+            return self.blank_id
+        raw_id = dec_id - self.dec_offset
+        if 0 <= raw_id < self.vocab_size:
+            return raw_id + self.ctc_offset
+        return self.unk_id + self.ctc_offset
+
+
+# ========== MODEL COMPONENTS ==========
 class PosEnc2D(nn.Module):
-    """Dynamic 2D Positional Encoding - matches working inference code"""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
-    def _make_pe(self, length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _make_pe(
+        self, length: int, dim: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
         pos = torch.arange(length, dtype=dtype, device=device).unsqueeze(1)
-        div = torch.exp(torch.arange(0, dim, 2, dtype=dtype, device=device) * (-math.log(10000.0) / dim))
+        div = torch.exp(
+            torch.arange(0, dim, 2, dtype=dtype, device=device)
+            * (-math.log(10000.0) / dim)
+        )
         pe = torch.zeros((length, dim), dtype=dtype, device=device)
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
@@ -132,77 +167,92 @@ class PosEnc2D(nn.Module):
             pe = torch.cat([pe, pad], dim=0)
         return x + pe.unsqueeze(0)
 
+
 class ConvStem(nn.Module):
     def __init__(self, dim: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 48, 3, 1, 1, bias=False), nn.BatchNorm2d(48), nn.SiLU(inplace=True),
-            nn.Conv2d(48, 96, 3, (2, 2), 1, bias=False), nn.BatchNorm2d(96), nn.SiLU(inplace=True),
-            nn.Conv2d(96, 160, 3, (2, 2), 1, bias=False), nn.BatchNorm2d(160), nn.SiLU(inplace=True),
-            nn.Conv2d(160, dim, 3, (2, 1), 1, bias=False), nn.BatchNorm2d(dim), nn.SiLU(inplace=True),
+            nn.Conv2d(1, 48, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(48, 96, 3, (2, 2), 1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(96, 160, 3, (2, 2), 1, bias=False),
+            nn.BatchNorm2d(160),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(160, dim, 3, (2, 1), 1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU(inplace=True),
             nn.Dropout2d(dropout),
         )
-    def forward(self, x): return self.net(x)
 
-class HybridContextOCRV2(nn.Module):
+    def forward(self, x):
+        return self.net(x)
+
+
+# ========== MAIN MODEL ==========
+class KiriOCR(nn.Module):
     def __init__(self, cfg: CFG, tok: CharTokenizer):
         super().__init__()
         self.cfg = cfg
+        self.tok = tok
         d = cfg.DROPOUT
+
         self.stem = ConvStem(cfg.ENC_DIM, d)
-        
-        # Use the working PosEnc2D implementation
         self.pos2d = PosEnc2D(cfg.ENC_DIM)
-        
+
         self.enc_ln_in = nn.LayerNorm(cfg.ENC_DIM)
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.ENC_DIM, 
-            nhead=cfg.ENC_HEADS, 
-            dim_feedforward=cfg.ENC_FF, 
-            dropout=d, 
-            batch_first=True, 
-            activation="gelu", 
-            norm_first=True
+            d_model=cfg.ENC_DIM,
+            nhead=cfg.ENC_HEADS,
+            dim_feedforward=cfg.ENC_FF,
+            dropout=d,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
         )
         self.enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.ENC_LAYERS)
         self.enc_ln = nn.LayerNorm(cfg.ENC_DIM)
-        
+
         if cfg.USE_CTC:
             self.ctc_head = nn.Sequential(
-                nn.LayerNorm(cfg.ENC_DIM), 
-                nn.Dropout(d), 
-                nn.Linear(cfg.ENC_DIM, tok.ctc_classes)
+                nn.LayerNorm(cfg.ENC_DIM),
+                nn.Dropout(d),
+                nn.Linear(cfg.ENC_DIM, tok.ctc_classes),
             )
-        
+
         self.mem_proj = nn.Linear(cfg.ENC_DIM, cfg.DEC_DIM, bias=False)
         self.dec_emb = nn.Embedding(tok.dec_vocab, cfg.DEC_DIM)
+
         dec_layer = nn.TransformerDecoderLayer(
-            d_model=cfg.DEC_DIM, 
-            nhead=cfg.DEC_HEADS, 
-            dim_feedforward=cfg.DEC_FF, 
-            dropout=d, 
-            batch_first=True, 
-            activation="gelu", 
-            norm_first=True
+            d_model=cfg.DEC_DIM,
+            nhead=cfg.DEC_HEADS,
+            dim_feedforward=cfg.DEC_FF,
+            dropout=d,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
         )
         self.dec = nn.TransformerDecoder(dec_layer, num_layers=cfg.DEC_LAYERS)
         self.dec_ln = nn.LayerNorm(cfg.DEC_DIM)
         self.dec_head = nn.Linear(cfg.DEC_DIM, tok.dec_vocab)
-        self.lm_head = nn.Linear(cfg.DEC_DIM, tok.dec_vocab)
+
+        if cfg.USE_LM:
+            self.lm_head = nn.Linear(cfg.DEC_DIM, tok.dec_vocab)
 
     def encode(self, imgs: torch.Tensor) -> torch.Tensor:
         x = self.stem(imgs)
         x = self.pos2d(x)
-        
-        # CRITICAL: Pool height to 1 before flattening (1D sequence)
         x = F.adaptive_avg_pool2d(x, (1, x.size(-1)))
-        
-        x = x.squeeze(2).permute(0, 2, 1)  # [B, W', C]
+        x = x.squeeze(2).permute(0, 2, 1)
         x = self.enc_ln_in(x)
         x = self.enc(x)
         x = self.enc_ln(x)
         return x
 
+
+# ========== PREPROCESSING ==========
 class ResizeKeepRatioPadNoCrop:
     def __init__(self, h: int, w: int):
         self.h = h
@@ -217,115 +267,129 @@ class ResizeKeepRatioPadNoCrop:
         nw = max(1, int(round(iw * scale)))
         img = img.resize((nw, self.h), Image.BILINEAR)
 
-        if nw == self.w:
-            return img
-        if nw < self.w:
-            # Pad right (or center?) - Training used left-aligned (paste at 0,0)
-            # app.py used center padding: ImageOps.expand(..., fill=255)
-            # We should match TRAINING which used paste((0,0)).
-            # app.py logic:
-            #   pad_total = self.w - nw
-            #   left = pad_total // 2
-            #   right = pad_total - left
-            #   ImageOps.expand...
-            
-            # Let's check training_transformer.py again.
-            # final_img.paste(img, (0, 0)) -> Left aligned.
-            # So app.py is slightly different (Center aligned).
-            # If the model was trained with left alignment, we should use left alignment.
-            # However, the user provided app.py as "example infer", implying it works.
-            # Let's stick to left alignment if training code did that,
-            # OR provide a flag.
-            
-            # Re-reading training code:
-            # final_img = Image.new("L", (self.img_width, self.img_height), 128)
-            # final_img.paste(img.crop((0,0, paste_w, self.img_height)), (0, 0))
-            # It is LEFT aligned with 128 gray padding.
-            
-            # The user's app.py uses ImageOps.expand with fill=255 (white).
-            # This is a discrepancy.
-            # If I use the user's app.py logic, it might be what they want.
-            # But technically training used 128 padding and left align.
-            # I will implement Left Align + 128 padding to match training,
-            # unless user strictly wants app.py behavior.
-            # But the user said "show to use that lib like my ocr class".
-            # I will use the app.py logic for now but maybe comment on it.
-            # Wait, app.py uses `ResizeKeepRatioPadNoCrop`.
-            
-            new_img = Image.new("L", (self.w, self.h), 128)
-            new_img.paste(img, (0, 0))
-            return new_img
+        if nw >= self.w:
+            return img.crop((0, 0, self.w, self.h))
 
-        return img.resize((self.w, self.h), Image.BILINEAR)
+        # Left-aligned padding with gray (128)
+        new_img = Image.new("L", (self.w, self.h), 128)
+        new_img.paste(img, (0, 0))
+        return new_img
+
 
 def preprocess_pil(cfg: CFG, pil: Image.Image) -> torch.Tensor:
-    img = pil.convert("RGB")
-    # Convert to grayscale for model
-    img = img.convert("L")
-    
+    img = pil.convert("L")
     img = ResizeKeepRatioPadNoCrop(cfg.IMG_H, cfg.IMG_W)(img)
-    
-    # Normalize
     img_tensor = torch.from_numpy(np.array(img)).float() / 255.0
     img_tensor = (img_tensor - 0.5) / 0.5
-    
-    return img_tensor.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+    return img_tensor.unsqueeze(0).unsqueeze(0)
 
-@torch.inference_mode()
-def estimate_ctc_length(ctc_logits_1: torch.Tensor, tok: CharTokenizer) -> int:
-    x = ctc_logits_1[0] if ctc_logits_1.dim() == 3 else ctc_logits_1
-    ids = x.argmax(dim=-1).tolist()
-    prev = None
+
+# ========== CONFIDENCE HELPERS ==========
+def compute_ctc_confidence(
+    ctc_logits: torch.Tensor, tok: CharTokenizer
+) -> Tuple[float, str, int]:
+    """
+    Compute CTC confidence and decode text.
+
+    Returns:
+        (confidence, decoded_text, estimated_length)
+    """
+    if ctc_logits.dim() == 3:
+        ctc_logits = ctc_logits.squeeze(0)  # [T, C]
+
+    probs = F.softmax(ctc_logits, dim=-1)
+    best_ids = ctc_logits.argmax(dim=-1).tolist()
+
+    # Decode with deduplication
+    text = tok.decode_ctc(best_ids)
+
+    # Confidence: average max probability at each timestep
+    max_probs = probs.max(dim=-1).values
+    confidence = max_probs.mean().item()
+
+    # Estimate length (count non-blank, non-repeated tokens)
     length = 0
-    for i in ids:
-        if i == prev:
-            continue
-        prev = i
-        if i <= tok.pad_id:
-            continue
-        length += 1
-    return length
+    prev = None
+    for idx in best_ids:
+        if idx != prev and idx >= tok.ctc_offset:
+            length += 1
+        prev = idx
 
+    return confidence, text, length
+
+
+def compute_sequence_confidence(log_probs: List[float]) -> float:
+    """Convert sequence log probabilities to confidence score."""
+    if not log_probs:
+        return 0.0
+
+    # Average log prob
+    avg_logp = sum(log_probs) / len(log_probs)
+
+    # Convert to probability (clamped to [0, 1])
+    confidence = math.exp(avg_logp)
+    return min(1.0, max(0.0, confidence))
+
+
+# ========== MAIN DECODING FUNCTION ==========
 @torch.inference_mode()
 def beam_decode_one_batched(
-    model: HybridContextOCRV2,
+    model: KiriOCR,
     mem_proj_1: torch.Tensor,
     tok: CharTokenizer,
     cfg: CFG,
     ctc_logits_1: Optional[torch.Tensor] = None,
-) -> str:
+) -> Tuple[str, float]:
+    """
+    Beam search decoder with confidence score.
+
+    Returns:
+        (decoded_text, confidence_score)
+    """
     device = mem_proj_1.device
     is_cuda = device.type == "cuda"
 
-    beams: List[Tuple[float, List[int], bool]] = [(0.0, [tok.dec_bos], False)]
-
-    max_steps = cfg.MAX_DEC_LEN
+    # Get CTC info for length estimation and fusion
+    ctc_confidence = None
     target_len = None
+
     if ctc_logits_1 is not None:
-        target_len = estimate_ctc_length(ctc_logits_1, tok)
-        if target_len > 0:
-            max_steps = min(max_steps, max(1, int(target_len * cfg.DEC_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD))
-        else:
-            max_steps = min(max_steps, cfg.DEC_MAX_LEN_PAD)
+        ctc_confidence, ctc_text, target_len = compute_ctc_confidence(ctc_logits_1, tok)
+
+    # Calculate max decoding steps
+    if target_len and target_len > 0:
+        max_steps = min(
+            cfg.MAX_DEC_LEN,
+            int(target_len * cfg.DEC_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD,
+        )
     else:
         mem_len = mem_proj_1.size(1)
-        max_steps = min(max_steps, max(1, int(mem_len * cfg.MEM_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD))
+        max_steps = min(
+            cfg.MAX_DEC_LEN, int(mem_len * cfg.MEM_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD
+        )
+
+    # Beam state: (score, token_ids, token_logprobs, finished)
+    beams: List[Tuple[float, List[int], List[float], bool]] = [
+        (0.0, [tok.dec_bos], [], False)
+    ]
 
     full_causal = torch.triu(
-        torch.ones((cfg.MAX_DEC_LEN + 2, cfg.MAX_DEC_LEN + 2), device=device, dtype=torch.bool),
-        diagonal=1
+        torch.ones(
+            (cfg.MAX_DEC_LEN + 2, cfg.MAX_DEC_LEN + 2), device=device, dtype=torch.bool
+        ),
+        diagonal=1,
     )
 
     use_amp = cfg.USE_AUTOCAST and is_cuda
 
-    for _ in range(max_steps):
-        if all(b[2] for b in beams):
+    for step in range(max_steps):
+        if all(b[3] for b in beams):
             break
 
-        alive = [b for b in beams if not b[2]]
-        done = [b for b in beams if b[2]]
+        alive = [b for b in beams if not b[3]]
+        done = [b for b in beams if b[3]]
 
-        if len(alive) == 0:
+        if not alive:
             beams = done
             break
 
@@ -333,124 +397,192 @@ def beam_decode_one_batched(
         B = len(alive)
 
         inp = torch.full((B, maxL), tok.dec_pad, device=device, dtype=torch.long)
-        for i, (_, seq, _) in enumerate(alive):
-            inp[i, :len(seq)] = torch.tensor(seq, device=device, dtype=torch.long)
+        for i, (_, seq, _, _) in enumerate(alive):
+            inp[i, : len(seq)] = torch.tensor(seq, device=device, dtype=torch.long)
 
         tgt = model.dec_emb(inp)
         causal = full_causal[:maxL, :maxL]
 
-        # Handle autocast manually if needed, or rely on context
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            out = model.dec(tgt=tgt, memory=mem_proj_1.expand(B, -1, -1), tgt_mask=causal)
+            out = model.dec(
+                tgt=tgt, memory=mem_proj_1.expand(B, -1, -1), tgt_mask=causal
+            )
             out = model.dec_ln(out)
             logits = model.dec_head(out)[:, -1, :]
             logp = F.log_softmax(logits, dim=-1)
 
-            if cfg.USE_LM and cfg.USE_LM_FUSION_EVAL:
+            if cfg.USE_LM and cfg.USE_LM_FUSION_EVAL and hasattr(model, "lm_head"):
                 lm_logits = model.lm_head(out)[:, -1, :]
                 logp = logp + cfg.LM_FUSION_ALPHA * F.log_softmax(lm_logits, dim=-1)
 
+        # Apply penalties
         unk_id = tok.unk_id + tok.dec_offset
 
-        for i, (_, seq, _) in enumerate(alive):
+        for i, (_, seq, _, _) in enumerate(alive):
             cur_len = len(seq) - 1
 
-            if target_len is not None and target_len > 0:
-                min_len = min(cfg.EOS_BIAS_UNTIL_LEN, max(1, int(target_len * 0.7)))
+            # EOS bias based on target length
+            if target_len and target_len > 0:
+                min_len = min(cfg.EOS_BIAS_UNTIL_LEN, max(1, int(target_len * 0.5)))
                 if cur_len < min_len:
-                    logp[i, tok.dec_eos] = logp[i, tok.dec_eos] - cfg.EOS_LOGP_BIAS
+                    logp[i, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
                 elif cur_len >= target_len:
-                    logp[i, tok.dec_eos] = logp[i, tok.dec_eos] + cfg.EOS_LOGP_BOOST
+                    logp[i, tok.dec_eos] += cfg.EOS_LOGP_BOOST
             else:
                 if cur_len < cfg.EOS_BIAS_UNTIL_LEN:
-                    logp[i, tok.dec_eos] = logp[i, tok.dec_eos] - cfg.EOS_LOGP_BIAS
+                    logp[i, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
 
+            # Repeat penalty
             if len(seq) >= 4 and seq[-1] == seq[-2] == seq[-3]:
-                logp[i, seq[-1]] = logp[i, seq[-1]] - cfg.REPEAT_LAST_PENALTY
+                logp[i, seq[-1]] -= cfg.REPEAT_LAST_PENALTY
 
-            logp[i, unk_id] = logp[i, unk_id] - cfg.UNK_LOGP_PENALTY
+            # UNK penalty
+            logp[i, unk_id] -= cfg.UNK_LOGP_PENALTY
 
         topv, topi = torch.topk(logp, k=cfg.BEAM, dim=-1)
 
-        new_beams: List[Tuple[float, List[int], bool]] = []
-        new_beams.extend(done)
+        # Expand beams
+        new_beams: List[Tuple[float, List[int], List[float], bool]] = list(done)
 
-        for bi, (base_score, seq, _) in enumerate(alive):
+        for bi, (base_score, seq, logprobs, _) in enumerate(alive):
             for v, tid in zip(topv[bi].tolist(), topi[bi].tolist()):
-                ns = seq + [int(tid)]
-                nf = (int(tid) == tok.dec_eos)
-                new_beams.append((base_score + float(v), ns, nf))
+                new_seq = seq + [int(tid)]
+                new_logprobs = logprobs + [float(v)]
+                is_finished = int(tid) == tok.dec_eos
+                new_score = base_score + float(v)
+                new_beams.append((new_score, new_seq, new_logprobs, is_finished))
 
-        def normed(s: float, seq_: List[int]) -> float:
-            L2 = max(1, len(seq_) - 1)
-            return s / (L2 ** cfg.BEAM_LENP)
+        # Length-normalized scoring
+        def normed(entry):
+            score, seq, _, _ = entry
+            L = max(1, len(seq) - 1)
+            return score / (L**cfg.BEAM_LENP)
 
-        new_beams.sort(key=lambda x: normed(x[0], x[1]), reverse=True)
-        beams = new_beams[:cfg.BEAM]
+        new_beams.sort(key=normed, reverse=True)
+        beams = new_beams[: cfg.BEAM]
 
-    def length_norm(score: float, seq: List[int]) -> float:
-        return score / (max(1, len(seq) - 1) ** cfg.BEAM_LENP)
+    # ========== FINAL SCORING WITH CTC FUSION ==========
+    def final_score_and_confidence(entry):
+        score, seq, logprobs, _ = entry
+        length = max(1, len(seq) - 1)
 
-    if ctc_logits_1 is not None and cfg.CTC_FUSION_ALPHA > 0:
-        log_probs = F.log_softmax(ctc_logits_1.squeeze(0), dim=-1)
+        dec_score = score / (length**cfg.BEAM_LENP)
+        dec_conf = compute_sequence_confidence(logprobs)
 
-        def ctc_sequence_log_prob(label_ids: List[int]) -> torch.Tensor:
-            if len(label_ids) == 0:
-                return log_probs[:, tok.blank_id].sum()
+        # CTC fusion
+        if ctc_logits_1 is not None and cfg.CTC_FUSION_ALPHA > 0:
+            ctc_score = compute_ctc_alignment_score(ctc_logits_1, seq, tok)
+            combined_score = dec_score + cfg.CTC_FUSION_ALPHA * ctc_score
+            return combined_score, dec_conf
 
-            blank = tok.blank_id
-            ext = [blank]
-            for lid in label_ids:
-                ext.append(lid)
-                ext.append(blank)
+        return dec_score, dec_conf
 
-            s_len = len(ext)
-            alpha = log_probs.new_full((s_len,), float("-inf"))
-            alpha[0] = log_probs[0, blank]
-            alpha[1] = log_probs[0, ext[1]]
+    scored = [(final_score_and_confidence(b), b) for b in beams]
+    scored.sort(key=lambda x: x[0][0], reverse=True)
 
-            for t in range(1, log_probs.size(0)):
-                next_alpha = log_probs.new_full((s_len,), float("-inf"))
-                for s in range(s_len):
-                    candidates = [alpha[s]]
-                    if s - 1 >= 0:
-                        candidates.append(alpha[s - 1])
-                    if s - 2 >= 0 and ext[s] != blank and ext[s] != ext[s - 2]:
-                        candidates.append(alpha[s - 2])
-                    next_alpha[s] = torch.logsumexp(torch.stack(candidates), dim=0) + log_probs[t, ext[s]]
-                alpha = next_alpha
+    (_, best_dec_conf), best_beam = scored[0]
+    _, best_seq, _, _ = best_beam
 
-            if s_len == 1:
-                return alpha[0]
-            return torch.logsumexp(torch.stack([alpha[s_len - 1], alpha[s_len - 2]]), dim=0)
-
-        def seq_to_ctc_labels(seq: List[int]) -> List[int]:
-            labels = []
-            for x in seq[1:]:
-                if x == tok.dec_eos:
-                    break
-                if x in (tok.dec_pad, tok.dec_bos):
-                    continue
-                y = x - tok.dec_offset
-                if 0 <= y < tok.vocab_size:
-                    labels.append(y + tok.ctc_offset)
-                else:
-                    labels.append(tok.unk_id + tok.ctc_offset)
-            return labels
-
-        def combined_score(entry):
-            dec_score = length_norm(entry[0], entry[1])
-            labels = seq_to_ctc_labels(entry[1])
-            ctc_score = ctc_sequence_log_prob(labels) / max(1, len(labels))
-            return dec_score + cfg.CTC_FUSION_ALPHA * float(ctc_score)
-
-        best = max(beams, key=combined_score)[1]
-    else:
-        best = max(beams, key=lambda x: length_norm(x[0], x[1]))[1]
-
+    # Decode text
     ids = []
-    for x in best[1:]:
+    for x in best_seq[1:]:
         if x == tok.dec_eos:
             break
         ids.append(x)
-    return tok.decode_dec(ids)
+    text = tok.decode_dec(ids)
+
+    # ========== COMPUTE FINAL CONFIDENCE ==========
+    # Combine decoder confidence with CTC confidence (if available)
+    if ctc_confidence is not None:
+        # Weighted average: favor decoder slightly
+        final_confidence = 0.6 * best_dec_conf + 0.4 * ctc_confidence
+    else:
+        final_confidence = best_dec_conf
+
+    return text, final_confidence
+
+
+def compute_ctc_alignment_score(
+    ctc_logits: torch.Tensor, dec_seq: List[int], tok: CharTokenizer
+) -> float:
+    """Compute CTC alignment score using forward algorithm."""
+    if ctc_logits.dim() == 3:
+        ctc_logits = ctc_logits.squeeze(0)
+
+    log_probs = F.log_softmax(ctc_logits, dim=-1)
+
+    # Convert decoder sequence to CTC labels
+    labels = []
+    for x in dec_seq[1:]:
+        if x == tok.dec_eos:
+            break
+        if x in (tok.dec_pad, tok.dec_bos):
+            continue
+        ctc_id = tok.dec_to_ctc_id(x)
+        labels.append(ctc_id)
+
+    if not labels:
+        return log_probs[:, tok.blank_id].sum().item() / max(1, log_probs.size(0))
+
+    # Forward algorithm
+    T = log_probs.size(0)
+    blank = tok.blank_id
+
+    # Extend: [b, l0, b, l1, b, ...]
+    ext = [blank]
+    for lid in labels:
+        ext.append(lid)
+        ext.append(blank)
+    S = len(ext)
+
+    alpha = log_probs.new_full((S,), float("-inf"))
+    alpha[0] = log_probs[0, blank]
+    if S > 1:
+        alpha[1] = log_probs[0, ext[1]]
+
+    for t in range(1, T):
+        new_alpha = log_probs.new_full((S,), float("-inf"))
+        for s in range(S):
+            candidates = [alpha[s]]
+            if s > 0:
+                candidates.append(alpha[s - 1])
+            if s > 1 and ext[s] != blank and ext[s] != ext[s - 2]:
+                candidates.append(alpha[s - 2])
+
+            stacked = torch.stack(
+                [
+                    (
+                        c
+                        if isinstance(c, torch.Tensor)
+                        else torch.tensor(c, device=log_probs.device)
+                    )
+                    for c in candidates
+                ]
+            )
+            new_alpha[s] = torch.logsumexp(stacked, dim=0) + log_probs[t, ext[s]]
+        alpha = new_alpha
+
+    if S == 1:
+        total = alpha[0]
+    else:
+        total = torch.logsumexp(torch.stack([alpha[S - 1], alpha[S - 2]]), dim=0)
+
+    return total.item() / max(1, len(labels))
+
+
+# ========== GREEDY CTC DECODE (FAST ALTERNATIVE) ==========
+@torch.inference_mode()
+def greedy_ctc_decode(
+    model: KiriOCR, imgs: torch.Tensor, tok: CharTokenizer, cfg: CFG
+) -> Tuple[str, float]:
+    """
+    Fast greedy CTC decoding (no beam search).
+
+    Returns:
+        (text, confidence)
+    """
+    mem = model.encode(imgs[:1])
+    ctc_logits = model.ctc_head(mem)
+
+    confidence, text, _ = compute_ctc_confidence(ctc_logits, tok)
+    return text, confidence
