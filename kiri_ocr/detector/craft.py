@@ -177,7 +177,7 @@ class CRAFTDetector:
             return
             
         try:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             if 'model_state_dict' in checkpoint:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
             else:

@@ -47,6 +47,23 @@ class TextDetector:
         self.craft_detector = None
         self.db_detector = None
         
+        # Resolve HuggingFace path
+        if model_path and "/" in model_path and not os.path.exists(model_path) and not model_path.startswith((".", "/")):
+             try:
+                 from huggingface_hub import hf_hub_download
+                 # Check for detector model in specific subfolder
+                 # Prefer detector/DB/detector.onnx as requested
+                 try:
+                     model_path = hf_hub_download(repo_id=model_path, filename="detector/DB/detector.onnx")
+                 except:
+                     try:
+                         # Fallback to detector/detector.onnx
+                         model_path = hf_hub_download(repo_id=model_path, filename="detector/detector.onnx")
+                     except:
+                         pass
+             except Exception as e:
+                 print(f"Warning: Could not download detector from HuggingFace: {e}")
+
         # Try to resolve model path if not provided
         if model_path is None:
              possible_paths = []

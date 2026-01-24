@@ -27,7 +27,7 @@ class OCR:
         self,
         model_path="mrrtmob/kiri-ocr",
         det_model_path=None,
-        det_method="craft",
+        det_method="db",
         det_conf_threshold=0.5,
         charset_path="models/charset_lite.txt",
         language="mixed",
@@ -64,6 +64,11 @@ class OCR:
 
         # Legacy model
         self.charset = None
+
+        # Store repo_id for detector lazy loading
+        self.repo_id = None
+        if "/" in model_path and not model_path.startswith((".", "/")):
+            self.repo_id = model_path
 
         # Resolve model path (HuggingFace, local, etc.)
         model_path = self._resolve_model_path(model_path)
@@ -106,7 +111,20 @@ class OCR:
                 except:
                     pass
 
-                return hf_hub_download(repo_id=model_path, filename="model.kiri")
+                # Try downloading vocab.json (user requested) or vocab_auto.json
+                try:
+                    hf_hub_download(repo_id=model_path, filename="vocab.json")
+                except:
+                    try:
+                        hf_hub_download(repo_id=model_path, filename="vocab_auto.json")
+                    except:
+                        pass
+
+                # Try downloading model.pt (user requested) or fallback to model.kiri
+                try:
+                    return hf_hub_download(repo_id=model_path, filename="model.pt")
+                except:
+                    return hf_hub_download(repo_id=model_path, filename="model.kiri")
 
             except Exception as e:
                 if self.verbose:
@@ -219,6 +237,7 @@ class OCR:
         candidates = [
             vocab_path,
             model_dir / Path(vocab_path).name if vocab_path else None,
+            model_dir / "vocab.json",
             model_dir / "vocab_auto.json",
             model_dir / "vocab_char.json",
         ]
@@ -270,9 +289,14 @@ class OCR:
         if self._detector is None:
             from .detector import TextDetector
 
+            det_path = self.det_model_path
+            # If no detector path specified, and we have a repo_id, and using DB/CRAFT
+            if det_path is None and self.repo_id and self.det_method in ["db", "craft"]:
+                det_path = self.repo_id
+
             self._detector = TextDetector(
                 method=self.det_method,
-                model_path=self.det_model_path,
+                model_path=det_path,
                 conf_threshold=self.det_conf_threshold,
             )
         return self._detector

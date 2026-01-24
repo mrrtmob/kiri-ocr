@@ -212,7 +212,11 @@ class KiriOCR(nn.Module):
             activation="gelu",
             norm_first=True,
         )
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.ENC_LAYERS)
+        self.enc = nn.TransformerEncoder(
+            enc_layer,
+            num_layers=cfg.ENC_LAYERS,
+            enable_nested_tensor=False,
+        )
         self.enc_ln = nn.LayerNorm(cfg.ENC_DIM)
 
         if cfg.USE_CTC:

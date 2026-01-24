@@ -4,22 +4,27 @@ import math
 from typing import List, Union, Tuple
 from pathlib import Path
 
+
 class DBDetector:
-    def __init__(self, model_path: str, 
-                 input_size: Tuple[int, int] = (1280, 736),
-                 binary_threshold: float = 0.2,
-                 polygon_threshold: float = 0.4,
-                 max_candidates: int = 500,
-                 unclip_ratio: float = 2.0,
-                 padding_pct: float = 0.10,
-                 padding_px: int = 20,
-                 padding_y_pct: float = 0.05,
-                 padding_y_px: int = 5,
-                 mean: Tuple[float, float, float] = (122.67891434, 116.66876762, 104.00698793),
-                 scale: float = 1.0 / 255.0):
+    def __init__(
+        self,
+        model_path: str,
+        input_size: Tuple[int, int] = (1280, 736),
+        binary_threshold: float = 0.2,
+        polygon_threshold: float = 0.4,
+        max_candidates: int = 500,
+        unclip_ratio: float = 2.0,
+        padding_pct: float = 0.10,
+        padding_px: int = 20,
+        padding_y_pct: float = 0.05,
+        padding_y_px: int = 5,
+        line_tolerance_ratio: float = 0.5,
+        mean: Tuple[float, float, float] = (122.67891434, 116.66876762, 104.00698793),
+        scale: float = 1.0 / 255.0,
+    ):
         """
         DB text detector.
-        
+
         Args:
             model_path: Path to ONNX model
             input_size: Input size for inference (width, height), must be multiples of 32
@@ -29,10 +34,13 @@ class DBDetector:
             unclip_ratio: Unclip ratio for expansion
             padding_pct: Horizontal expansion percentage (0.08 = 8%)
             padding_px: Horizontal expansion fixed pixels
+            padding_y_pct: Vertical expansion percentage
+            padding_y_px: Vertical expansion fixed pixels
+            line_tolerance_ratio: Ratio of avg height to use as tolerance for line grouping
             mean: Mean for normalization
             scale: Scale for normalization
         """
-        
+
         self.model_path = model_path
         self.input_size = input_size
         self.binary_threshold = binary_threshold
@@ -43,20 +51,25 @@ class DBDetector:
         self.padding_px = padding_px
         self.padding_y_pct = padding_y_pct
         self.padding_y_px = padding_y_px
+        self.line_tolerance_ratio = line_tolerance_ratio
         self.mean = mean
         self.scale = scale
-        
+
         if not Path(self.model_path).exists():
-             raise FileNotFoundError(f"DB model not found at {self.model_path}")
+            raise FileNotFoundError(f"DB model not found at {self.model_path}")
 
         self.net = cv2.dnn.TextDetectionModel_DB(self.model_path)
-        self.net.setInputParams(scale=self.scale, size=self.input_size, mean=self.mean, swapRB=True)
+        self.net.setInputParams(
+            scale=self.scale, size=self.input_size, mean=self.mean, swapRB=True
+        )
         self.net.setBinaryThreshold(self.binary_threshold)
         self.net.setPolygonThreshold(self.polygon_threshold)
         self.net.setMaxCandidates(self.max_candidates)
         self.net.setUnclipRatio(self.unclip_ratio)
 
-    def detect_text(self, image: Union[str, Path, np.ndarray]) -> List[Tuple[np.ndarray, float]]:
+    def detect_text(
+        self, image: Union[str, Path, np.ndarray]
+    ) -> List[Tuple[np.ndarray, float]]:
         if isinstance(image, (str, Path)):
             image_cv = cv2.imread(str(image))
             if image_cv is None:
@@ -65,31 +78,141 @@ class DBDetector:
             image_cv = image
             if len(image_cv.shape) == 2:  # Grayscale
                 image_cv = cv2.cvtColor(image_cv, cv2.COLOR_GRAY2BGR)
-            elif len(image_cv.shape) == 3 and image_cv.shape[2] == 4: # RGBA
+            elif len(image_cv.shape) == 3 and image_cv.shape[2] == 4:  # RGBA
                 image_cv = cv2.cvtColor(image_cv, cv2.COLOR_BGRA2BGR)
         else:
             raise TypeError("Image must be a path or numpy array")
 
         # Calculate dynamic size based on the specific image dimensions
-        # This prevents distorting small images while respecting self.input_size as a limit
         h, w = image_cv.shape[:2]
         new_w, new_h = self._get_dynamic_size(w, h)
-        
+
         # Update the network input size for this specific inference
-        self.net.setInputParams(scale=self.scale, size=(new_w, new_h), mean=self.mean, swapRB=True)
+        self.net.setInputParams(
+            scale=self.scale, size=(new_w, new_h), mean=self.mean, swapRB=True
+        )
 
         boxes, confidences = self.net.detect(image_cv)
-        
+
         results = []
         if boxes is not None:
             boxes_np = [np.int32(box) for box in boxes]
             padded_boxes = self._apply_smart_padding(boxes_np)
-            
+
             # Combine with confidences
             for box, conf in zip(padded_boxes, confidences):
-                 results.append((box, float(conf)))
-                
+                results.append((box, float(conf)))
+
+            # Sort boxes in reading order (top-to-bottom, left-to-right)
+            results = self._sort_boxes_reading_order(results)
+
         return results
+
+    def _sort_boxes_reading_order(
+        self, results: List[Tuple[np.ndarray, float]]
+    ) -> List[Tuple[np.ndarray, float]]:
+        """
+        Sort boxes in reading order: top to bottom, left to right.
+
+        Algorithm:
+        1. Calculate bounding rect for each box
+        2. Group boxes into "lines" based on vertical overlap/proximity
+        3. Sort lines top to bottom
+        4. Within each line, sort boxes left to right
+
+        Args:
+            results: List of (box, confidence) tuples
+
+        Returns:
+            Sorted list of (box, confidence) tuples
+        """
+        if not results or len(results) <= 1:
+            return results
+
+        # Extract box info
+        box_info = []
+        for idx, (box, conf) in enumerate(results):
+            x, y, w, h = cv2.boundingRect(box)
+            box_info.append(
+                {
+                    "idx": idx,
+                    "box": box,
+                    "conf": conf,
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "center_x": x + w / 2,
+                    "center_y": y + h / 2,
+                    "top": y,
+                    "bottom": y + h,
+                }
+            )
+
+        # Calculate line tolerance based on average height
+        avg_height = np.mean([b["h"] for b in box_info])
+        y_tolerance = avg_height * self.line_tolerance_ratio
+
+        # Sort by top Y coordinate first
+        box_info.sort(key=lambda b: b["top"])
+
+        # Group into lines using vertical overlap detection
+        lines = []
+        used = set()
+
+        for i, box in enumerate(box_info):
+            if i in used:
+                continue
+
+            # Start a new line with this box
+            current_line = [box]
+            used.add(i)
+
+            # Find all boxes that belong to the same line
+            line_top = box["top"]
+            line_bottom = box["bottom"]
+
+            for j, other_box in enumerate(box_info):
+                if j in used:
+                    continue
+
+                # Check if boxes are on the same line
+                # Two boxes are on the same line if:
+                # 1. Their vertical centers are within tolerance, OR
+                # 2. They have significant vertical overlap
+
+                vertical_overlap = min(line_bottom, other_box["bottom"]) - max(
+                    line_top, other_box["top"]
+                )
+                min_height = min(box["h"], other_box["h"])
+
+                # Check vertical center proximity
+                line_center_y = (line_top + line_bottom) / 2
+                center_diff = abs(other_box["center_y"] - line_center_y)
+
+                # Box belongs to same line if centers are close OR significant overlap
+                if center_diff <= y_tolerance or (
+                    vertical_overlap > 0 and vertical_overlap >= min_height * 0.5
+                ):
+                    current_line.append(other_box)
+                    used.add(j)
+                    # Update line bounds
+                    line_top = min(line_top, other_box["top"])
+                    line_bottom = max(line_bottom, other_box["bottom"])
+
+            lines.append(current_line)
+
+        # Sort lines by their average top position (top to bottom)
+        lines.sort(key=lambda line: np.mean([b["top"] for b in line]))
+
+        # Sort boxes within each line by X coordinate (left to right)
+        sorted_results = []
+        for line in lines:
+            line.sort(key=lambda b: b["x"])
+            for b in line:
+                sorted_results.append((b["box"], b["conf"]))
+
+        return sorted_results
 
     def _get_dynamic_size(self, w: int, h: int) -> Tuple[int, int]:
         """
@@ -99,21 +222,17 @@ class DBDetector:
         3. Are multiples of 32 (required by DBNet)
         """
         target_w, target_h = self.input_size
-        
+
         # Calculate scale to fit within target bounds
         scale = min(target_w / w, target_h / h)
-        
-        # If image is very small, we might actually want to scale UP to target_h
-        # But usually, just fitting within bounds is safer.
-        # However, for tiny text (h=32), we ensure it doesn't get crushed.
-        
+
         new_w = int(w * scale)
         new_h = int(h * scale)
 
         # Align to multiples of 32
         new_w = max(32, int(round(new_w / 32) * 32))
         new_h = max(32, int(round(new_h / 32) * 32))
-        
+
         return new_w, new_h
 
     def _apply_smart_padding(self, boxes: List[np.ndarray]) -> List[np.ndarray]:
@@ -122,55 +241,52 @@ class DBDetector:
         """
         if not boxes:
             return []
-            
+
         n = len(boxes)
         # Calculate AABBs for distance checking
         aabbs = [cv2.boundingRect(b) for b in boxes]
-        
+
         # Max allowable expansion (total width/height increase)
-        max_pad_w = np.full(n, float('inf'))
-        max_pad_h = np.full(n, float('inf'))
-        
+        max_pad_w = np.full(n, float("inf"))
+        max_pad_h = np.full(n, float("inf"))
+
         for i in range(n):
             xi, yi, wi, hi = aabbs[i]
-            
+
             for j in range(n):
-                if i == j: continue
-                
+                if i == j:
+                    continue
+
                 xj, yj, wj, hj = aabbs[j]
-                
+
                 # Check vertical band overlap (limits horizontal expansion)
-                # Determine vertical intersection
                 y_start = max(yi, yj)
                 y_end = min(yi + hi, yj + hj)
-                
-                if y_start < y_end: # Overlap in Y
-                    # Calculate horizontal distance
+
+                if y_start < y_end:  # Overlap in Y
                     dist_x = 0
-                    if xi >= xj + wj: # i is right of j
+                    if xi >= xj + wj:  # i is right of j
                         dist_x = xi - (xj + wj)
-                    elif xj >= xi + wi: # j is right of i
+                    elif xj >= xi + wi:  # j is right of i
                         dist_x = xj - (xi + wi)
                     else:
-                        dist_x = 0 # Overlap
-                    
-                    # Symmetric expansion means each side expands by dist_x/2
-                    # Total width increase allowed is dist_x
+                        dist_x = 0  # Overlap
+
                     max_pad_w[i] = min(max_pad_w[i], dist_x)
-                    
+
                 # Check horizontal band overlap (limits vertical expansion)
                 x_start = max(xi, xj)
                 x_end = min(xi + wi, xj + wj)
-                
-                if x_start < x_end: # Overlap in X
+
+                if x_start < x_end:  # Overlap in X
                     dist_y = 0
-                    if yi >= yj + hj: # i is below j
+                    if yi >= yj + hj:  # i is below j
                         dist_y = yi - (yj + hj)
-                    elif yj >= yi + hi: # j is below i
+                    elif yj >= yi + hi:  # j is below i
                         dist_y = yj - (yi + hi)
                     else:
                         dist_y = 0
-                    
+
                     max_pad_h[i] = min(max_pad_h[i], dist_y)
 
         final_boxes = []
@@ -178,27 +294,25 @@ class DBDetector:
             rect = cv2.minAreaRect(box)
             (center, (w, h), angle) = rect
             (cx, cy) = center
-            
+
             # Ensure w is the "long" side
             if w < h:
                 w, h = h, w
                 angle += 90
 
             # Target padding
-            # Use height (approx font size) to ensure minimum padding for short words
-            # Add 0.5 * h to width (approx half char on each side)
             target_pad_w = (w * self.padding_pct) + (h * 0.5) + self.padding_px
             target_pad_h = (h * self.padding_y_pct) + self.padding_y_px
-            
+
             # Clamp by neighbor limits
             actual_pad_w = min(target_pad_w, max(0, max_pad_w[i]))
             actual_pad_h = min(target_pad_h, max(0, max_pad_h[i]))
-            
+
             new_w = w + actual_pad_w
             new_h = h + actual_pad_h
-            
+
             new_rect = ((cx, cy), (new_w, new_h), angle)
             new_box = cv2.boxPoints(new_rect)
             final_boxes.append(np.int32(new_box))
-            
+
         return final_boxes
