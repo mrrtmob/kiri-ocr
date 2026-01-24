@@ -130,6 +130,9 @@ class DocumentRenderer:
     
     def create_report(self, image_path, results, output_path='ocr_report.html'):
         """Create HTML report"""
+        # Calculate stats safely
+        avg_conf = np.mean([r['confidence'] for r in results]) * 100 if results else 0.0
+
         html = f"""
 <!DOCTYPE html>
 <html>
@@ -159,7 +162,7 @@ class DocumentRenderer:
     <div class="stats">
         <strong>Statistics:</strong><br>
         Total Regions: {len(results)}<br>
-        Average Confidence: {np.mean([r['confidence'] for r in results])*100:.2f}%<br>
+        Average Confidence: {avg_conf:.2f}%<br>
         High Confidence (>90%): {sum(1 for r in results if r['confidence'] > 0.9)}<br>
         Medium Confidence (70-90%): {sum(1 for r in results if 0.7 < r['confidence'] <= 0.9)}<br>
         Low Confidence (<70%): {sum(1 for r in results if r['confidence'] <= 0.7)}
