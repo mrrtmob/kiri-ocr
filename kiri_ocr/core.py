@@ -35,6 +35,7 @@ class OCR:
         device="cpu",
         verbose=False,
         use_beam_search=True,
+        use_fp16=None,
     ):  # NEW: option to disable beam search
         """
         Args:
@@ -47,6 +48,7 @@ class OCR:
             device: 'cpu' or 'cuda'
             verbose: Print loading info
             use_beam_search: Use beam search (True) or greedy CTC (False)
+            use_fp16: Force FP16 usage (True/False/None)
         """
         self.device = device
         self.verbose = verbose
@@ -56,6 +58,7 @@ class OCR:
         self.det_method = det_method
         self.det_conf_threshold = det_conf_threshold
         self.use_beam_search = use_beam_search
+        self.use_fp16 = use_fp16
 
         # Transformer-specific
         self.is_transformer = False
@@ -209,6 +212,10 @@ class OCR:
             self.transformer_cfg = CFG()
             state_dict = checkpoint
             vocab_path = ""
+
+        # Override FP16 setting if requested
+        if self.use_fp16 is not None:
+            self.transformer_cfg.USE_FP16 = self.use_fp16
 
         # Find vocab file
         vocab_path = self._find_vocab_file(vocab_path, model_path)

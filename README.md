@@ -78,6 +78,7 @@ print(text)
 # Get detailed results with confidence scores
 for line in results:
     print(f"{line['text']} (confidence: {line['confidence']:.1%})")
+
 ```
 
 ### Single Line Recognition
