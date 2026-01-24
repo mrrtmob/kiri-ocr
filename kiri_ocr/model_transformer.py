@@ -85,16 +85,34 @@ class CharTokenizer:
         return "".join(out)
 
 class PosEnc2D(nn.Module):
+    """Dynamic 2D Positional Encoding - matches working inference code"""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
+    def _make_pe(self, length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        pos = torch.arange(length, dtype=dtype, device=device).unsqueeze(1)
+        div = torch.exp(torch.arange(0, dim, 2, dtype=dtype, device=device) * (-math.log(10000.0) / dim))
+        pe = torch.zeros((length, dim), dtype=dtype, device=device)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
-        # Simplified 2D Positional Encoding
-        # In production, use the full sin/cos implementation provided earlier
-        # This is a placeholder for brevity, but the previous implementation is preferred
-        return x 
+        num_feats = c // 2
+        if num_feats == 0:
+            return x
+        pe_y = self._make_pe(h, num_feats, x.device, x.dtype)
+        pe_x = self._make_pe(w, num_feats, x.device, x.dtype)
+        pe_y = pe_y.unsqueeze(2).repeat(1, 1, w)
+        pe_x = pe_x.transpose(0, 1).unsqueeze(0).repeat(h, 1, 1)
+        pe = torch.cat([pe_y, pe_x], dim=1)
+        pe = pe.permute(1, 0, 2)
+        if pe.size(0) < c:
+            pad = torch.zeros((c - pe.size(0), h, w), device=x.device, dtype=x.dtype)
+            pe = torch.cat([pe, pad], dim=0)
+        return x + pe.unsqueeze(0)
 
 class ConvStem(nn.Module):
     def __init__(self, dim: int, dropout: float):
@@ -114,20 +132,41 @@ class HybridContextOCRV2(nn.Module):
         self.cfg = cfg
         d = cfg.DROPOUT
         self.stem = ConvStem(cfg.ENC_DIM, d)
-        # Note: Add full PosEnc2D here if needed, or use learned embedding
-        self.pos_embed = nn.Parameter(torch.randn(1, cfg.ENC_DIM, 1, 1) * 0.02) 
+        
+        # Use the working PosEnc2D implementation
+        self.pos2d = PosEnc2D(cfg.ENC_DIM)
         
         self.enc_ln_in = nn.LayerNorm(cfg.ENC_DIM)
-        enc_layer = nn.TransformerEncoderLayer(d_model=cfg.ENC_DIM, nhead=cfg.ENC_HEADS, dim_feedforward=cfg.ENC_FF, dropout=d, batch_first=True, activation="gelu", norm_first=True)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.ENC_DIM, 
+            nhead=cfg.ENC_HEADS, 
+            dim_feedforward=cfg.ENC_FF, 
+            dropout=d, 
+            batch_first=True, 
+            activation="gelu", 
+            norm_first=True
+        )
         self.enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.ENC_LAYERS)
         self.enc_ln = nn.LayerNorm(cfg.ENC_DIM)
         
         if cfg.USE_CTC:
-            self.ctc_head = nn.Sequential(nn.LayerNorm(cfg.ENC_DIM), nn.Dropout(d), nn.Linear(cfg.ENC_DIM, tok.ctc_classes))
+            self.ctc_head = nn.Sequential(
+                nn.LayerNorm(cfg.ENC_DIM), 
+                nn.Dropout(d), 
+                nn.Linear(cfg.ENC_DIM, tok.ctc_classes)
+            )
         
         self.mem_proj = nn.Linear(cfg.ENC_DIM, cfg.DEC_DIM, bias=False)
         self.dec_emb = nn.Embedding(tok.dec_vocab, cfg.DEC_DIM)
-        dec_layer = nn.TransformerDecoderLayer(d_model=cfg.DEC_DIM, nhead=cfg.DEC_HEADS, dim_feedforward=cfg.DEC_FF, dropout=d, batch_first=True, activation="gelu", norm_first=True)
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=cfg.DEC_DIM, 
+            nhead=cfg.DEC_HEADS, 
+            dim_feedforward=cfg.DEC_FF, 
+            dropout=d, 
+            batch_first=True, 
+            activation="gelu", 
+            norm_first=True
+        )
         self.dec = nn.TransformerDecoder(dec_layer, num_layers=cfg.DEC_LAYERS)
         self.dec_ln = nn.LayerNorm(cfg.DEC_DIM)
         self.dec_head = nn.Linear(cfg.DEC_DIM, tok.dec_vocab)
@@ -135,9 +174,12 @@ class HybridContextOCRV2(nn.Module):
 
     def encode(self, imgs: torch.Tensor) -> torch.Tensor:
         x = self.stem(imgs)
-        # Simple learnable pos embedding + flattening
-        x = x + self.pos_embed
-        x = x.flatten(2).permute(0, 2, 1) # [B, Seq, Dim]
+        x = self.pos2d(x)
+        
+        # CRITICAL: Pool height to 1 before flattening (1D sequence)
+        x = F.adaptive_avg_pool2d(x, (1, x.size(-1)))
+        
+        x = x.squeeze(2).permute(0, 2, 1)  # [B, W', C]
         x = self.enc_ln_in(x)
         x = self.enc(x)
         x = self.enc_ln(x)
