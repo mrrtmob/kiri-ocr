@@ -189,6 +189,8 @@ kiri-ocr train \
 *   `--arch transformer`: Switches to the Transformer pipeline.
 *   `--height`: Must be **48** for this architecture.
 *   `--vocab`: Path to `vocab_char.json`. If not provided, it will be auto-generated from your dataset.
+*   `--save-steps`: Save a checkpoint every N steps (e.g. `--save-steps 1000`).
+*   `--resume`: Resume training from the latest checkpoint in `output-dir`.
 
 **Using the Transformer Model in Python:**
 

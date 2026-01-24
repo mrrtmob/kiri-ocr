@@ -334,10 +334,40 @@ def train_command(args):
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.dec_pad)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # 6. Training Loop
-    print(f"  Starting training for {args.epochs} epochs on {device}...")
+    # 6. Resume from Checkpoint
+    start_epoch = 0
+    global_step = 0
     
-    for epoch in range(args.epochs):
+    resume_path = f"{args.output_dir}/latest.pt"
+    if args.resume and os.path.exists(resume_path):
+        print(f"  🔄 Resuming from {resume_path}...")
+        try:
+            ckpt = torch.load(resume_path, map_location=device)
+            # Load model state
+            if 'model' in ckpt:
+                model.load_state_dict(ckpt['model'], strict=False)
+            else:
+                model.load_state_dict(ckpt, strict=False) # Legacy raw state dict
+            
+            # Load optimizer and step info
+            if 'optimizer' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            
+            if 'epoch' in ckpt:
+                start_epoch = ckpt['epoch']
+                print(f"  ✓ Resuming at Epoch {start_epoch+1}")
+            
+            if 'step' in ckpt:
+                global_step = ckpt['step']
+                print(f"  ✓ Resuming at Step {global_step}")
+                
+        except Exception as e:
+            print(f"  ⚠️ Resume failed: {e}. Starting fresh.")
+
+    # 7. Training Loop
+    print(f"  Starting training for {args.epochs} epochs (from {start_epoch}) on {device}...")
+    
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0
         count = 0
@@ -350,8 +380,8 @@ def train_command(args):
             # Prepare Inputs/Targets for Teacher Forcing
             # Input:  <bos> A B C
             # Target: A B C <eos>
-            dec_inp = tgts[:, :-1] 
-            dec_out = tgts[:, 1:]  
+            dec_inp = tgts[:, :-1]
+            dec_out = tgts[:, 1:]
             
             optimizer.zero_grad()
             
@@ -380,21 +410,42 @@ def train_command(args):
             
             epoch_loss += loss.item()
             count += 1
-            pbar.set_postfix({'loss': loss.item()})
+            global_step += 1
+            pbar.set_postfix({'loss': loss.item(), 'step': global_step})
             
-        # Save Checkpoint
+            # Save Step Checkpoint
+            if args.save_steps > 0 and global_step % args.save_steps == 0:
+                step_path = f"{args.output_dir}/checkpoint_step_{global_step}.pt"
+                # Save full state
+                state = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'config': cfg,
+                    'vocab_path': vocab_path,
+                    'epoch': epoch,
+                    'step': global_step
+                }
+                torch.save(state, step_path)
+                torch.save(state, f"{args.output_dir}/latest.pt")
+                # print(f"  Saved step checkpoint: {step_path}") # Optional to reduce spam
+            
+        # Save Epoch Checkpoint
         avg_loss = epoch_loss / max(1, count)
         print(f"  Epoch {epoch+1} Avg Loss: {avg_loss:.4f}")
         
-        # Save model and the vocab used for it
+        # Save full state for epoch
         save_path = f"{args.output_dir}/model_epoch_{epoch+1}.pt"
-        torch.save({
-            'model': model.state_dict(), 
+        state = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
             'config': cfg,
-            'vocab_path': vocab_path # Store where the vocab is
-        }, save_path)
+            'vocab_path': vocab_path,
+            'epoch': epoch + 1, # Finished this epoch
+            'step': global_step
+        }
+        torch.save(state, save_path)
         
         # Save 'latest.pt' for easy resumption
-        torch.save(model.state_dict(), f"{args.output_dir}/latest.pt")
+        torch.save(state, f"{args.output_dir}/latest.pt")
 
     print(f"✅ Training Complete. Models saved to {args.output_dir}")

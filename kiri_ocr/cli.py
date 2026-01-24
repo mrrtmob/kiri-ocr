@@ -216,6 +216,8 @@ def main():
     
     # NEW ARGUMENT: Transformer Specific
     train_parser.add_argument('--vocab', help='Path to vocab_char.json (Required for Transformer)')
+    train_parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=epoch only)')
+    train_parser.add_argument('--resume', action='store_true', help='Resume from latest checkpoint')
 
     # === GENERATE ===
     gen_parser = subparsers.add_parser('generate', help='🎨 Generate synthetic training data')
