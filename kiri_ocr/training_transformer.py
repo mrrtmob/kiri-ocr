@@ -117,25 +117,30 @@ class HFTransformerDataset(Dataset):
                 img = img.convert("L")
             
             w, h = img.size
-            
-            # Resize height to 48, keep aspect ratio
             new_w = int(w * self.img_height / h)
             img = img.resize((new_w, self.img_height), Image.BILINEAR)
             
-            # Create canvas (padding)
-            final_img = Image.new("L", (self.img_width, self.img_height), 128) # 128 is gray padding
+            final_img = Image.new("L", (self.img_width, self.img_height), 128)
             paste_w = min(new_w, self.img_width)
             final_img.paste(img.crop((0,0, paste_w, self.img_height)), (0, 0))
             
-            # Normalize [-1, 1]
             img_tensor = torch.from_numpy(np.array(final_img)).float() / 255.0
             img_tensor = (img_tensor - 0.5) / 0.5
-            img_tensor = img_tensor.unsqueeze(0) # [1, H, W]
+            img_tensor = img_tensor.unsqueeze(0)
 
-            # Tokenize
-            ids = [self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id) for c in text]
-            # Add BOS (1) and EOS (2) tokens
+            # --- BUG FIX START ---
+            # 1. Get ID from vocab (e.g., 'a' -> 1)
+            # 2. Add dec_offset (e.g., 1 + 3 = 4)
+            # This ensures 'a' (4) is different from BOS (1)
+            ids = []
+            for c in text:
+                raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
+                ids.append(raw_id + self.tokenizer.dec_offset)
+            
+            # Add BOS (1) and EOS (2)
+            # Note: Do NOT add offset to BOS/EOS, they are fixed at 1 and 2
             ids = [self.tokenizer.dec_bos] + ids + [self.tokenizer.dec_eos]
+            # --- BUG FIX END ---
             
             return img_tensor, torch.LongTensor(ids)
             
@@ -184,8 +189,6 @@ class TransformerDataset(Dataset):
         try:
             img = Image.open(img_path).convert("L")
             w, h = img.size
-            
-            # Resize height to 48, keep aspect ratio
             new_w = int(w * self.img_height / h)
             img = img.resize((new_w, self.img_height), Image.BILINEAR)
             
@@ -194,15 +197,22 @@ class TransformerDataset(Dataset):
             paste_w = min(new_w, self.img_width)
             final_img.paste(img.crop((0,0, paste_w, self.img_height)), (0, 0))
             
-            # Normalize [-1, 1]
             img_tensor = torch.from_numpy(np.array(final_img)).float() / 255.0
             img_tensor = (img_tensor - 0.5) / 0.5
-            img_tensor = img_tensor.unsqueeze(0) # [1, H, W]
+            img_tensor = img_tensor.unsqueeze(0)
 
-            # Tokenize
-            ids = [self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id) for c in text]
-            # Add BOS (1) and EOS (2) tokens
+            # --- BUG FIX START ---
+            ids = []
+            for c in text:
+                # Raw ID from json (e.g. 0 for unk, 1 for 'a')
+                raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
+                # Shift by 3 so valid chars start at 3 (or 4 depending on vocab)
+                # If raw_id is unk(0), it becomes 3.
+                # Pad is 0. So unk(3) is now distinct from Pad(0).
+                ids.append(raw_id + self.tokenizer.dec_offset)
+
             ids = [self.tokenizer.dec_bos] + ids + [self.tokenizer.dec_eos]
+            # --- BUG FIX END ---
             
             return img_tensor, torch.LongTensor(ids)
             
