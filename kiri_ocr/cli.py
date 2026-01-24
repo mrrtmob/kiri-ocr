@@ -488,12 +488,12 @@ def main():
         generate_command(args)
 
     elif args.command == "generate-detector":
-        from .detector.dataset import generate_detector_dataset_command
+        from .detector.craft.dataset import generate_detector_dataset_command
 
         generate_detector_dataset_command(args)
 
     elif args.command == "train-detector":
-        from .detector.training import train_detector_command
+        from .detector.craft.training import train_detector_command
 
         train_detector_command(args)
 

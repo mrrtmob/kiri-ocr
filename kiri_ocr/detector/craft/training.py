@@ -1,3 +1,6 @@
+"""
+Training utilities for CRAFT text detection model.
+"""
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,15 +9,19 @@ import numpy as np
 import os
 import json
 from PIL import Image
-import time
 import cv2
 from tqdm import tqdm
 
-from .craft import CRAFT
+from .model import CRAFT
 
-# === Dataset ===
 
 class CRAFTDataset(Dataset):
+    """
+    Dataset for CRAFT training.
+    
+    Loads images and their corresponding region/affinity maps.
+    """
+    
     def __init__(self, data_dir, image_size=512):
         self.data_dir = data_dir
         self.image_size = image_size
@@ -63,7 +70,7 @@ class CRAFTDataset(Dataset):
         std = np.array([0.229, 0.224, 0.225])
         image = (image - mean) / std
         
-        image = image.transpose(2, 0, 1) # CHW
+        image = image.transpose(2, 0, 1)  # CHW
         
         # Load maps
         region_path = os.path.join(self.data_dir, 'labels', sample['region_map'])
@@ -79,9 +86,9 @@ class CRAFTDataset(Dataset):
             affinity = cv2.resize(affinity, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST)
             
         except:
-             h, w = image.shape[1] // 2, image.shape[2] // 2
-             region = np.zeros((h, w), dtype=np.float32)
-             affinity = np.zeros((h, w), dtype=np.float32)
+            h, w = image.shape[1] // 2, image.shape[2] // 2
+            region = np.zeros((h, w), dtype=np.float32)
+            affinity = np.zeros((h, w), dtype=np.float32)
 
         # Expand dims for channel
         region = np.expand_dims(region, 0)
@@ -89,9 +96,16 @@ class CRAFTDataset(Dataset):
         
         return torch.FloatTensor(image), torch.FloatTensor(region), torch.FloatTensor(affinity)
 
-# === Trainer ===
 
 class CRAFTTrainer:
+    """
+    Trainer for CRAFT text detection model.
+    
+    Example:
+        trainer = CRAFTTrainer(data_dir='detector_dataset')
+        trainer.train(epochs=100, batch_size=8)
+    """
+    
     def __init__(self, data_dir, output_dir='runs/detect/khmer_text_detector'):
         self.data_dir = data_dir
         self.output_dir = output_dir
@@ -106,6 +120,14 @@ class CRAFTTrainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4, weight_decay=1e-5)
         
     def train(self, epochs=100, batch_size=8, num_workers=2):
+        """
+        Train the CRAFT model.
+        
+        Args:
+            epochs: Number of training epochs
+            batch_size: Batch size for training
+            num_workers: Number of data loading workers
+        """
         dataset = CRAFTDataset(self.data_dir)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
         
@@ -170,8 +192,9 @@ class CRAFTTrainer:
                 'loss': avg_loss,
             }, save_path)
 
+
 def train_detector_command(args):
-    """CLI Command handler"""
+    """CLI Command handler for training."""
     # Args from cli.py: data_yaml (unused now), model_size, epochs, batch_size, etc.
     # We'll use --data-yaml to point to dataset directory (dataset_info.json is inside)
     # The default in CLI is detector_dataset/data.yaml. We can strip 'data.yaml'.

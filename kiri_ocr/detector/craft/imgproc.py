@@ -1,18 +1,46 @@
 # -*- coding: utf-8 -*-
+"""
+Image processing utilities for CRAFT text detection.
+"""
 import numpy as np
 from skimage import io
 import cv2
 
+
 def loadImage(img_file):
+    """
+    Load image from file.
+    
+    Args:
+        img_file: Path to image file
+        
+    Returns:
+        RGB image as numpy array
+    """
     img = io.imread(img_file)           # RGB order
-    if img.shape[0] == 2: img = img[0]
-    if len(img.shape) == 2 : img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-    if img.shape[2] == 4:   img = img[:,:,:3]
+    if img.shape[0] == 2:
+        img = img[0]
+    if len(img.shape) == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    if img.shape[2] == 4:
+        img = img[:, :, :3]
     img = np.array(img)
 
     return img
 
+
 def normalizeMeanVariance(in_img, mean=(0.485, 0.456, 0.406), variance=(0.229, 0.224, 0.225)):
+    """
+    Normalize image with ImageNet mean and variance.
+    
+    Args:
+        in_img: Input image (RGB order)
+        mean: Mean values for normalization
+        variance: Variance values for normalization
+        
+    Returns:
+        Normalized image
+    """
     # should be RGB order
     img = in_img.copy().astype(np.float32)
 
@@ -20,7 +48,19 @@ def normalizeMeanVariance(in_img, mean=(0.485, 0.456, 0.406), variance=(0.229, 0
     img /= np.array([variance[0] * 255.0, variance[1] * 255.0, variance[2] * 255.0], dtype=np.float32)
     return img
 
+
 def denormalizeMeanVariance(in_img, mean=(0.485, 0.456, 0.406), variance=(0.229, 0.224, 0.225)):
+    """
+    Denormalize image (reverse of normalizeMeanVariance).
+    
+    Args:
+        in_img: Normalized image
+        mean: Mean values used for normalization
+        variance: Variance values used for normalization
+        
+    Returns:
+        Denormalized image (uint8)
+    """
     # should be RGB order
     img = in_img.copy()
     img *= variance
@@ -29,7 +69,22 @@ def denormalizeMeanVariance(in_img, mean=(0.485, 0.456, 0.406), variance=(0.229,
     img = np.clip(img, 0, 255).astype(np.uint8)
     return img
 
+
 def resize_aspect_ratio(img, square_size, interpolation, mag_ratio=1):
+    """
+    Resize image while preserving aspect ratio.
+    
+    Args:
+        img: Input image
+        square_size: Target canvas size
+        interpolation: OpenCV interpolation method
+        mag_ratio: Magnification ratio
+        
+    Returns:
+        resized: Resized image on canvas
+        ratio: Resize ratio applied
+        size_heatmap: Size of output heatmap
+    """
     height, width, channel = img.shape
 
     # magnify image size
@@ -39,11 +94,10 @@ def resize_aspect_ratio(img, square_size, interpolation, mag_ratio=1):
     if target_size > square_size:
         target_size = square_size
     
-    ratio = target_size / max(height, width)    
+    ratio = target_size / max(height, width)
 
     target_h, target_w = int(height * ratio), int(width * ratio)
-    proc = cv2.resize(img, (target_w, target_h), interpolation = interpolation)
-
+    proc = cv2.resize(img, (target_w, target_h), interpolation=interpolation)
 
     # make canvas and paste image
     target_h32, target_w32 = target_h, target_w
@@ -55,11 +109,21 @@ def resize_aspect_ratio(img, square_size, interpolation, mag_ratio=1):
     resized[0:target_h, 0:target_w, :] = proc
     target_h, target_w = target_h32, target_w32
 
-    size_heatmap = (int(target_w/2), int(target_h/2))
+    size_heatmap = (int(target_w / 2), int(target_h / 2))
 
     return resized, ratio, size_heatmap
 
+
 def cvt2HeatmapImg(img):
+    """
+    Convert score map to heatmap visualization.
+    
+    Args:
+        img: Score map (0-1 range)
+        
+    Returns:
+        Colorized heatmap image
+    """
     img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
     img = cv2.applyColorMap(img, cv2.COLORMAP_JET)
     return img

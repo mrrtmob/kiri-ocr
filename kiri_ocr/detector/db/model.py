@@ -1,3 +1,9 @@
+"""
+DB (Differentiable Binarization) Text Detector.
+
+This module implements text detection using the DB (Differentiable Binarization) method
+via OpenCV's DNN module with pre-trained ONNX models.
+"""
 import cv2
 import numpy as np
 import math
@@ -6,6 +12,19 @@ from pathlib import Path
 
 
 class DBDetector:
+    """
+    DB (Differentiable Binarization) text detector.
+    
+    Uses OpenCV's cv2.dnn.TextDetectionModel_DB for efficient text detection.
+    Supports dynamic input sizing and smart padding to avoid box overlaps.
+    
+    Example:
+        detector = DBDetector('DB_TD500_resnet50.onnx')
+        results = detector.detect_text('image.jpg')
+        for box, confidence in results:
+            print(f"Box: {box}, Confidence: {confidence}")
+    """
+    
     def __init__(
         self,
         model_path: str,
@@ -23,7 +42,7 @@ class DBDetector:
         scale: float = 1.0 / 255.0,
     ):
         """
-        DB text detector.
+        Initialize DB text detector.
 
         Args:
             model_path: Path to ONNX model
@@ -70,6 +89,15 @@ class DBDetector:
     def detect_text(
         self, image: Union[str, Path, np.ndarray]
     ) -> List[Tuple[np.ndarray, float]]:
+        """
+        Detect text in an image.
+        
+        Args:
+            image: Path to image or numpy array (BGR format)
+            
+        Returns:
+            List of (box, confidence) tuples, sorted in reading order
+        """
         if isinstance(image, (str, Path)):
             image_cv = cv2.imread(str(image))
             if image_cv is None:
@@ -216,7 +244,7 @@ class DBDetector:
 
     def _get_dynamic_size(self, w: int, h: int) -> Tuple[int, int]:
         """
-        Calculates new dimensions that:
+        Calculate new dimensions that:
         1. Fit within self.input_size
         2. Preserve Aspect Ratio (crucial for small text)
         3. Are multiples of 32 (required by DBNet)

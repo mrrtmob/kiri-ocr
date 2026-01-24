@@ -1,6 +1,8 @@
 """
-Realistic Document Dataset Generator for Text Detection (CRAFT-style)
-FIXED: Division errors, box characters, font sizes, boundary checking
+Realistic Document Dataset Generator for Text Detection (CRAFT-style).
+
+This module provides tools to generate synthetic training data for CRAFT-based
+text detection models with realistic multi-line document layouts.
 """
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
@@ -10,8 +12,9 @@ import random
 from typing import Union, Dict, List, Tuple
 from pathlib import Path
 
+
 class MultilingualDatasetGenerator:
-    """Dataset generator for realistic document-style text with multiple lines"""
+    """Dataset generator for realistic document-style text with multiple lines."""
     
     def __init__(self, output_dir='dataset', image_width=512, image_height=512):
         self.output_dir = output_dir
@@ -24,7 +27,7 @@ class MultilingualDatasetGenerator:
         os.makedirs(os.path.join(output_dir, 'annotations'), exist_ok=True)
         
     def test_font_support(self, font, text_sample: str) -> bool:
-        """Test if font actually renders text (not boxes)"""
+        """Test if font actually renders text (not boxes)."""
         try:
             # Create small test image
             test_img = Image.new('RGB', (100, 50), color=(255, 255, 255))
@@ -41,7 +44,7 @@ class MultilingualDatasetGenerator:
             return False
 
     def is_text_supported(self, font, text):
-        """Check if font supports the characters in text"""
+        """Check if font supports the characters in text."""
         try:
             notdef_char = '\uFFFF'
             try:
@@ -67,7 +70,7 @@ class MultilingualDatasetGenerator:
             return True
 
     def load_text_lines(self, text_file: Union[str, List[str]]) -> List[str]:
-        """Load text lines from file(s)"""
+        """Load text lines from file(s)."""
         if isinstance(text_file, str):
             text_file = [text_file]
         
@@ -83,7 +86,7 @@ class MultilingualDatasetGenerator:
         return lines
     
     def get_font_list(self, font_dir: str) -> List[str]:
-        """Get list of font files"""
+        """Get list of font files."""
         font_files = []
         if not os.path.isdir(font_dir):
             print(f"Warning: Font directory '{font_dir}' not found")
@@ -95,7 +98,7 @@ class MultilingualDatasetGenerator:
         return font_files
     
     def create_sentence(self, text_pool: List[str], max_words: int = None) -> str:
-        """Create a sentence-like text from pool"""
+        """Create a sentence-like text from pool."""
         if max_words is None:
             max_words = random.randint(4, 10)
         
@@ -106,7 +109,7 @@ class MultilingualDatasetGenerator:
         return ' '.join(words)
     
     def get_text_dimensions(self, draw, text, font):
-        """Get text dimensions safely"""
+        """Get text dimensions safely."""
         try:
             bbox = draw.textbbox((0, 0), text, font=font)
             width = max(bbox[2] - bbox[0], 1)
@@ -118,7 +121,7 @@ class MultilingualDatasetGenerator:
     
     def generate_character_boxes(self, draw: ImageDraw, text: str, 
                                 font: ImageFont, start_x: int, start_y: int) -> List[Dict]:
-        """Generate character-level bounding boxes"""
+        """Generate character-level bounding boxes."""
         boxes = []
         current_x = start_x
         
@@ -150,7 +153,7 @@ class MultilingualDatasetGenerator:
     
     def generate_ground_truth_maps(self, boxes: List[Dict], 
                                    img_width: int, img_height: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Generate region and affinity ground truth maps"""
+        """Generate region and affinity ground truth maps."""
         region_map = np.zeros((img_height, img_width), dtype=np.float32)
         affinity_map = np.zeros((img_height, img_width), dtype=np.float32)
         
@@ -220,7 +223,7 @@ class MultilingualDatasetGenerator:
         return region_map, affinity_map
     
     def apply_augmentation(self, img: Image.Image) -> Image.Image:
-        """Apply random augmentations"""
+        """Apply random augmentations."""
         if random.random() > 0.5:
             brightness = random.uniform(0.7, 1.3)
             img = Image.eval(img, lambda x: int(min(255, max(0, x * brightness))))
@@ -241,7 +244,7 @@ class MultilingualDatasetGenerator:
         return img
     
     def generate_multiline_document(self, draw, text_pool, font, all_boxes, layout_type='paragraph'):
-        """Generate realistic multi-line document layouts with safety checks"""
+        """Generate realistic multi-line document layouts with safety checks."""
         items = []
         
         # Calculate line metrics with safety checks
@@ -440,7 +443,7 @@ class MultilingualDatasetGenerator:
                 current_y += line_height + line_spacing
         
         elif layout_type == 'list_items':
-            # Bullet point list (new layout)
+            # Bullet point list
             for line_num in range(num_lines):
                 if current_y + line_height > self.image_height - margin_bottom:
                     break
@@ -534,7 +537,7 @@ class MultilingualDatasetGenerator:
     
     def generate_sample(self, text_pool: List[str], font_path: str, font_size: int, 
                        idx: int, language: str = 'unknown', augment: bool = True) -> Dict:
-        """Generate a realistic multi-line document sample"""
+        """Generate a realistic multi-line document sample."""
         bg_color = random.randint(240, 255)
         img = Image.new('RGB', (self.image_width, self.image_height), 
                        color=(bg_color, bg_color, bg_color))
@@ -607,7 +610,7 @@ class MultilingualDatasetGenerator:
                         font_size_range: Tuple[int, int] = (18, 32),
                         augment: bool = True,
                         language_ratio: Dict[str, float] = None) -> None:
-        """Generate complete dataset"""
+        """Generate complete dataset."""
         print("\n" + "="*60)
         print("  CRAFT Dataset Generator (Multi-Line Real Documents)")
         print("="*60)
@@ -756,7 +759,7 @@ class MultilingualDatasetGenerator:
 
 
 def generate_detector_dataset_command(args):
-    """CLI Command handler"""
+    """CLI Command handler for dataset generation."""
     text_files = args.text_file
     font_dirs = args.fonts_dir
     language_ratio = None
@@ -796,7 +799,7 @@ def generate_detector_dataset_command(args):
         text_files=text_files,
         font_dir=font_dirs,
         num_samples=num_samples,
-        font_size_range=(18, 32),  # SMALLER fonts like real docs
+        font_size_range=(18, 32),
         augment=not args.no_augment,
         language_ratio=language_ratio
     )

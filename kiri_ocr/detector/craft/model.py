@@ -1,9 +1,18 @@
+"""
+CRAFT (Character Region Awareness for Text detection) Model.
+
+This module contains the neural network architecture for CRAFT-based text detection.
+"""
+import os
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import namedtuple
+
 
 def init_weights(modules):
+    """Initialize network weights."""
     for m in modules:
         if isinstance(m, nn.Conv2d):
             nn.init.xavier_uniform_(m.weight.data)
@@ -16,7 +25,10 @@ def init_weights(modules):
             m.weight.data.normal_(0, 0.01)
             m.bias.data.zero_()
 
+
 class vgg16_bn(nn.Module):
+    """VGG16 with Batch Normalization backbone for CRAFT."""
+    
     def __init__(self, pretrained=True, freeze=True):
         super(vgg16_bn, self).__init__()
         # Load pretrained vgg16_bn from torchvision
@@ -85,7 +97,10 @@ class vgg16_bn(nn.Module):
         # Returns [conv7, conv5_3, conv4_3, conv3_3, conv2_2]
         return [h_fc7, h_relu5_3, h_relu4_3, h_relu3_3, h_relu2_2]
 
+
 class double_conv(nn.Module):
+    """Double convolution block for U-Net style decoder."""
+    
     def __init__(self, in_ch, mid_ch, out_ch):
         super(double_conv, self).__init__()
         self.conv = nn.Sequential(
@@ -101,14 +116,23 @@ class double_conv(nn.Module):
         x = self.conv(x)
         return x
 
+
 class CRAFT(nn.Module):
+    """
+    CRAFT: Character Region Awareness for Text detection.
+    
+    This model outputs two maps:
+    - Region score map: probability of each pixel being part of a character
+    - Affinity score map: probability of each pixel being between adjacent characters
+    """
+    
     def __init__(self, pretrained=False, freeze=False):
         super(CRAFT, self).__init__()
 
-        """ Base network """
+        # Base network (VGG16 with batch norm)
         self.basenet = vgg16_bn(pretrained, freeze)
 
-        """ U network """
+        # U network decoder
         self.upconv1 = double_conv(1024, 512, 256)
         self.upconv2 = double_conv(512, 256, 128)
         self.upconv3 = double_conv(256, 128, 64)
@@ -130,10 +154,20 @@ class CRAFT(nn.Module):
         init_weights(self.conv_cls.modules())
         
     def forward(self, x):
-        """ Base network """
+        """
+        Forward pass.
+        
+        Args:
+            x: Input image tensor [B, 3, H, W]
+            
+        Returns:
+            y: Output scores [B, H/2, W/2, 2] (region, affinity)
+            feature: Feature map from last upconv layer
+        """
+        # Base network
         sources = self.basenet(x)
 
-        """ U network """
+        # U network decoder
         y = torch.cat([sources[0], sources[1]], dim=1)
         y = self.upconv1(y)
 
@@ -151,27 +185,26 @@ class CRAFT(nn.Module):
 
         y = self.conv_cls(feature)
 
-        return y.permute(0,2,3,1), feature
+        return y.permute(0, 2, 3, 1), feature
 
-# Wrapper for usage
-import os
-import cv2
-import numpy as np
-try:
-    from . import craft_utils
-    from . import imgproc
-except ImportError:
-    # Handle if running standalone
-    import craft_utils
-    import imgproc
 
 class CRAFTDetector:
+    """
+    High-level wrapper for CRAFT text detection.
+    
+    Example:
+        detector = CRAFTDetector()
+        detector.load_weights('best.pth')
+        boxes = detector.detect_text('image.jpg')
+    """
+    
     def __init__(self, pretrained=False):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = CRAFT(pretrained=pretrained).to(self.device)
         self.model.eval()
     
     def load_weights(self, path):
+        """Load model weights from checkpoint."""
         if not os.path.exists(path):
             print(f"Warning: Model path {path} does not exist")
             return
@@ -188,6 +221,22 @@ class CRAFTDetector:
             print(f"Error loading weights: {e}")
 
     def detect_text(self, image_path, text_threshold=0.7, link_threshold=0.4, low_text=0.4, poly=False):
+        """
+        Detect text in an image.
+        
+        Args:
+            image_path: Path to input image
+            text_threshold: Text confidence threshold
+            link_threshold: Link confidence threshold
+            low_text: Low text score threshold
+            poly: Whether to return polygon outputs
+            
+        Returns:
+            List of bounding boxes
+        """
+        from . import imgproc
+        from . import utils as craft_utils
+        
         # Load image
         image = imgproc.loadImage(image_path)
         
@@ -197,11 +246,16 @@ class CRAFTDetector:
         return bboxes
 
     def test_net(self, image, text_threshold, link_threshold, low_text, poly):
+        """Run inference on an image."""
+        from . import imgproc
+        from . import utils as craft_utils
+        
         # resize
-        # args.canvas_size = 1280, mag_ratio = 1.5
         canvas_size = 1280
         mag_ratio = 1.5
-        img_resized, target_ratio, size_heatmap = imgproc.resize_aspect_ratio(image, canvas_size, interpolation=cv2.INTER_LINEAR, mag_ratio=mag_ratio)
+        img_resized, target_ratio, size_heatmap = imgproc.resize_aspect_ratio(
+            image, canvas_size, interpolation=cv2.INTER_LINEAR, mag_ratio=mag_ratio
+        )
         ratio_h = ratio_w = 1 / target_ratio
 
         # preprocessing
@@ -215,34 +269,24 @@ class CRAFTDetector:
             y, feature = self.model(x)
 
         # make score and link map
-        score_text = y[0,:,:,0].cpu().data.numpy()
-        score_link = y[0,:,:,1].cpu().data.numpy()
+        score_text = y[0, :, :, 0].cpu().data.numpy()
+        score_link = y[0, :, :, 1].cpu().data.numpy()
         
         # Apply sigmoid (since we trained with logits)
-        # Note: If loading official weights which might output 0-1, this double sigmoid might be issue?
-        # But looking at official code, they don't have sigmoid in model.
-        # But checking other implementations, they usually do y = y.permute(...); score = y[...].
-        # Let's assume we need sigmoid for OUR training.
-        # For official weights, if they behave as logits, we need it too.
-        # Safest is to check range or just apply it if we are sure our model outputs logits.
-        # Our model definition ends with Conv2d. So it is logits.
-        
-        # Sigmoid using numpy or torch? y is tensor here?
-        # y is tensor [1, H, W, 2]
-        
-        # Actually y is already used above as cpu().data.numpy()
-        # Let's apply sigmoid on tensor before converting
         y = torch.sigmoid(y)
-        score_text = y[0,:,:,0].cpu().data.numpy()
-        score_link = y[0,:,:,1].cpu().data.numpy()
+        score_text = y[0, :, :, 0].cpu().data.numpy()
+        score_link = y[0, :, :, 1].cpu().data.numpy()
 
         # Post-processing
-        boxes, polys = craft_utils.getDetBoxes(score_text, score_link, text_threshold, link_threshold, low_text, poly)
+        boxes, polys = craft_utils.getDetBoxes(
+            score_text, score_link, text_threshold, link_threshold, low_text, poly
+        )
 
         # coordinate adjustment
         boxes = craft_utils.adjustResultCoordinates(boxes, ratio_w, ratio_h)
         polys = craft_utils.adjustResultCoordinates(polys, ratio_w, ratio_h)
         for k in range(len(polys)):
-            if polys[k] is None: polys[k] = boxes[k]
+            if polys[k] is None:
+                polys[k] = boxes[k]
 
         return boxes, polys, score_text

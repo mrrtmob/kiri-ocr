@@ -4,12 +4,11 @@ import os
 import warnings
 import numpy as np
 
+# Import base components
+from .base import TextBox, DetectionLevel
+
 # Import legacy components
-from .legacy import (
-    ImageProcessingTextDetector, 
-    TextBox, 
-    DetectionLevel
-)
+from .legacy import ImageProcessingTextDetector
 
 # Import CRAFT detector
 try:
