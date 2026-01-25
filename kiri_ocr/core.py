@@ -182,7 +182,16 @@ class OCR:
 
                 # Extract config and state dict
                 if "config" in checkpoint:
-                    self.cfg = checkpoint["config"]
+                    config_data = checkpoint["config"]
+                    # Convert dict to CFG object if needed
+                    if isinstance(config_data, dict):
+                        self.cfg = CFG()
+                        self.cfg.IMG_H = config_data.get("IMG_H", self.cfg.IMG_H)
+                        self.cfg.IMG_W = config_data.get("IMG_W", self.cfg.IMG_W)
+                        self.cfg.USE_CTC = config_data.get("USE_CTC", self.cfg.USE_CTC)
+                        self.cfg.USE_FP16 = config_data.get("USE_FP16", self.cfg.USE_FP16)
+                    else:
+                        self.cfg = config_data
                     state_dict = checkpoint["model"]
                     vocab_path = checkpoint.get("vocab_path", "")
                 else:

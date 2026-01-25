@@ -101,7 +101,6 @@ Kiri OCR uses a Transformer architecture with:
 - **Transformer encoder** for contextual understanding
 - **CTC head** for fast alignment-free decoding
 - **Attention decoder** for accurate sequence generation
-
 - **CNN backbone** for visual feature extraction
 - **Transformer encoder** for contextual understanding
 - **CTC head** for fast alignment-free decoding
@@ -138,18 +137,18 @@ kiri-ocr train \
 
 ### Training Arguments
 
-| Argument         | Default | Description                                              |
-| ---------------- | ------- | -------------------------------------------------------- |
-| `--height`       | 48      | Image height                                             |
-| `--width`        | 640     | Image width                                              |
-| `--batch-size`   | 32      | Training batch size                                      |
-| `--epochs`       | 100     | Number of training epochs                                |
-| `--lr`           | 0.0003  | Learning rate                                            |
-| `--ctc-weight`   | 0.5     | Weight for CTC loss                                      |
-| `--dec-weight`   | 0.5     | Weight for decoder loss                                  |
-| `--vocab`        | Auto    | Path to vocab.json (auto-generated if not provided)      |
-| `--save-steps`   | 1000    | Save checkpoint every N steps                            |
-| `--resume`       | False   | Resume from latest checkpoint                            |
+| Argument         | Default | Description                                         |
+| ---------------- | ------- | --------------------------------------------------- |
+| `--height`     | 48      | Image height                                        |
+| `--width`      | 640     | Image width                                         |
+| `--batch-size` | 32      | Training batch size                                 |
+| `--epochs`     | 100     | Number of training epochs                           |
+| `--lr`         | 0.0003  | Learning rate                                       |
+| `--ctc-weight` | 0.5     | Weight for CTC loss                                 |
+| `--dec-weight` | 0.5     | Weight for decoder loss                             |
+| `--vocab`      | Auto    | Path to vocab.json (auto-generated if not provided) |
+| `--save-steps` | 1000    | Save checkpoint every N steps                       |
+| `--resume`     | False   | Resume from latest checkpoint                       |
 
 ### Resume Training
 
@@ -503,9 +502,9 @@ If you find this project useful:
 
 ```bibtex
 @software{kiri_ocr,
-  author = {MRTMOB},
+  author = {mrrtmob},
   title = {Kiri OCR: Lightweight Khmer and English OCR},
-  year = {2024},
+  year = {2026},
   url = {https://github.com/mrrtmob/kiri-ocr}
 }
 ```
