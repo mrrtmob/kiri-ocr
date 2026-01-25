@@ -46,7 +46,7 @@ classifiers = [
 Homepage = "https://github.com/mrrtmob/kiri-ocr"
 Repository = "https://github.com/mrrtmob/kiri-ocr"
 Issues = "https://github.com/mrrtmob/kiri-ocr/issues"
-Documentation = "https://github.com/mrrtmob/kiri-ocr#readme"
+Documentation = "https://github.com/mrrtmob/kiri-ocr/wiki"
 
 [project.scripts]
 kiri-ocr = "kiri_ocr.cli:main"
