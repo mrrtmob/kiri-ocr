@@ -58,3 +58,5 @@ benchmark/*.txt
 !benchmark/benchmark_table.png
 fonts/
 js/
+
+tests/
