@@ -15,13 +15,11 @@
 
 ## ✨ Key Features
 
-- **Lightweight**: Compact CRNN model optimized for speed and efficiency
+- **High Accuracy**: Transformer model with hybrid CTC + attention decoder
 - **Bi-lingual**: Native support for English and Khmer (and mixed text)
 - **Document Processing**: Automatic text line and word detection
 - **Easy to Use**: Simple Python API and CLI
-- **Two Architectures**:
-  - **CRNN** (default): Fast, lightweight, great for production
-  - **Transformer**: Higher accuracy, hybrid CTC + attention decoder
+- **Lightweight**: Compact model with efficient inference
 
 ## 📊 Dataset
 
@@ -97,63 +95,12 @@ print(f"'{text}' ({confidence:.1%})")
 
 ## 🎓 Training Models
 
-Kiri OCR supports two model architectures:
+Kiri OCR uses a Transformer architecture with:
 
-| Architecture          | Speed     | Accuracy | Image Height | Best For           |
-| --------------------- | --------- | -------- | ------------ | ------------------ |
-| **CRNN**        | ⚡ Fast   | Good     | 32px         | Production, mobile |
-| **Transformer** | 🐢 Slower | Higher   | 48px         | Maximum accuracy   |
-
----
-
-## 🏋️ Training CRNN Model (Default)
-
-### Option A: Using Hugging Face Dataset
-
-```bash
-kiri-ocr train \
-    --arch crnn \
-    --hf-dataset mrrtmob/km_en_image_line \
-    --epochs 100 \
-    --batch-size 32 \
-    --device cuda \
-    --output-dir output_crnn
-```
-
-### Option B: Using Local Data
-
-1. **Prepare your data:**
-
-```
-data/
-├── train/
-│   ├── labels.txt       # Format: filename<TAB>text
-│   └── images/
-│       ├── img_001.png
-│       └── ...
-└── val/
-    ├── labels.txt
-    └── images/
-```
-
-2. **Train:**
-
-```bash
-kiri-ocr train \
-    --arch crnn \
-    --train-labels data/train/labels.txt \
-    --val-labels data/val/labels.txt \
-    --epochs 100 \
-    --batch-size 32 \
-    --device cuda
-```
-
----
-
-## 🚀 Training Transformer Model (Higher Accuracy)
-
-The Transformer model uses a hybrid architecture with:
-
+- **CNN backbone** for visual feature extraction
+- **Transformer encoder** for contextual understanding
+- **CTC head** for fast alignment-free decoding
+- **Attention decoder** for accurate sequence generation
 - **CNN backbone** for visual feature extraction
 - **Transformer encoder** for contextual understanding
 - **CTC head** for fast alignment-free decoding
@@ -163,9 +110,8 @@ The Transformer model uses a hybrid architecture with:
 
 ```bash
 kiri-ocr train \
-    --arch transformer \
     --hf-dataset mrrtmob/km_en_image_line \
-    --output-dir output_transformer \
+    --output-dir output \
     --epochs 100 \
     --batch-size 32 \
     --device cuda
@@ -175,9 +121,8 @@ kiri-ocr train \
 
 ```bash
 kiri-ocr train \
-    --arch transformer \
     --hf-dataset mrrtmob/km_en_image_line \
-    --output-dir output_transformer \
+    --output-dir output \
     --height 48 \
     --width 640 \
     --batch-size 32 \
@@ -190,16 +135,19 @@ kiri-ocr train \
     --device cuda
 ```
 
-### Transformer-Specific Arguments
+### Training Arguments
 
 | Argument         | Default | Description                                         |
 | ---------------- | ------- | --------------------------------------------------- |
-| `--height`     | 48      | Image height (must be 48 for transformer)           |
+| `--height`     | 48      | Image height                                        |
 | `--width`      | 640     | Image width                                         |
+| `--batch-size` | 32      | Training batch size                                 |
+| `--epochs`     | 100     | Number of training epochs                           |
+| `--lr`         | 0.0003  | Learning rate                                       |
 | `--ctc-weight` | 0.5     | Weight for CTC loss                                 |
 | `--dec-weight` | 0.5     | Weight for decoder loss                             |
-| `--vocab`      | Auto    | Path to vocab JSON (auto-generated if not provided) |
-| `--save-steps` | 0       | Save checkpoint every N steps                       |
+| `--vocab`      | Auto    | Path to vocab.json (auto-generated if not provided) |
+| `--save-steps` | 1000    | Save checkpoint every N steps                       |
 | `--resume`     | False   | Resume from latest checkpoint                       |
 
 ### Resume Training
@@ -208,9 +156,8 @@ If training is interrupted:
 
 ```bash
 kiri-ocr train \
-    --arch transformer \
     --hf-dataset mrrtmob/km_en_image_line \
-    --output-dir output_transformer \
+    --output-dir output \
     --epochs 100 \
     --resume \
     --device cuda
@@ -231,7 +178,6 @@ drive.mount('/content/drive')
 
 # Cell 2: Train
 !kiri-ocr train \
-    --arch transformer \
     --hf-dataset mrrtmob/km_en_image_line \
     --output-dir /content/drive/MyDrive/kiri_models/v1 \
     --height 48 \
@@ -248,7 +194,7 @@ drive.mount('/content/drive')
 from kiri_ocr import OCR
 
 ocr = OCR(
-    model_path="/content/drive/MyDrive/kiri_models/v1/best_model.pt",
+    model_path="/content/drive/MyDrive/kiri_models/v1/model.safetensors",
     device="cuda"
 )
 
@@ -271,29 +217,37 @@ print(f"'{text}' ({confidence:.1%})")
 After training, your output directory will contain:
 
 ```
-output_transformer/
-├── vocab_auto.json          # Vocabulary (required for inference!)
-├── latest.pt                # Latest checkpoint (for resume)
-├── best_model.pt            # Best validation accuracy
-├── model_epoch_1.pt
-├── model_epoch_2.pt
-├── ...
-├── checkpoint_step_5000.pt
+output/
+├── vocab.json               # Vocabulary (required for inference!)
+├── model.safetensors        # Best model weights (safetensors format)
+├── model_meta.json          # Model config metadata
+├── model_optim.pt           # Optimizer state
+├── latest.safetensors       # Latest checkpoint (for resume)
+├── latest_meta.json         # Latest config metadata
+├── latest_optim.pt          # Latest optimizer state
 └── history.json             # Training metrics
 ```
+
+**Note:** Safetensors format is used for model weights with separate JSON metadata files. Legacy `.pt` format is still supported for loading.
 
 ---
 
 ## 🔧 Using Custom Models
 
-### Load Transformer Model
+### Load Custom Model
 
 ```python
 from kiri_ocr import OCR
 
-# Kiri OCR auto-detects the model type!
+# Load your trained model (safetensors format)
 ocr = OCR(
-    model_path="output_transformer/best_model.pt",
+    model_path="output/model.safetensors",
+    device="cuda"
+)
+
+# Also supports legacy .pt format
+ocr = OCR(
+    model_path="output/model.pt",
     device="cuda"
 )
 
@@ -395,9 +349,6 @@ kiri-ocr train --config config.yaml
 **Example `config.yaml`:**
 
 ```yaml
-# Model Architecture
-arch: transformer
-
 # Image dimensions
 height: 48
 width: 640
@@ -408,12 +359,12 @@ epochs: 100
 lr: 0.0003
 weight_decay: 0.01
 
-# Loss weights (transformer only)
+# Loss weights
 ctc_weight: 0.5
 dec_weight: 0.5
 
 # Paths
-output_dir: output_transformer
+output_dir: output
 save_steps: 5000
 
 # Device
@@ -465,7 +416,16 @@ Epoch 100/100 | Loss: 0.25 (CTC: 0.3, Dec: 0.2) | Val Acc: 92%
 **Cause:** Model not trained enough (need 50-100 epochs minimum)
 
 ```bash
-# Check your model
+# Check your model metadata
+python -c "
+import json
+with open('model_meta.json') as f:
+    meta = json.load(f)
+print(f\"Epoch: {meta.get('epoch', 'unknown')}\")
+print(f\"Step: {meta.get('step', 'unknown')}\")
+"
+
+# Or for legacy .pt format
 python -c "
 import torch
 ckpt = torch.load('model.pt', map_location='cpu')
@@ -476,12 +436,12 @@ print(f\"Step: {ckpt.get('step', 'unknown')}\")
 
 ### Vocab file not found
 
-**Cause:** `vocab_auto.json` must be in the same directory as the model
+**Cause:** `vocab.json` must be in the same directory as the model
 
 ```bash
 # Check files
-ls output_transformer/
-# Should show: vocab_auto.json, best_model.pt, etc.
+ls output/
+# Should show: vocab.json, model.safetensors, model_meta.json, etc.
 ```
 
 ### CUDA out of memory
@@ -489,7 +449,7 @@ ls output_transformer/
 **Fix:** Reduce batch size
 
 ```bash
-kiri-ocr train --arch transformer --batch-size 16 ...
+kiri-ocr train --batch-size 16 ...
 ```
 
 ### Low confidence scores
@@ -499,6 +459,25 @@ kiri-ocr train --arch transformer --batch-size 16 ...
 ```python
 # In OCR initialization
 ocr = OCR(model_path="model.pt", use_beam_search=False)
+```
+
+---
+
+## 📁 Project Structure
+
+```
+kiri_ocr/
+├── __init__.py           # Main exports
+├── core.py               # OCR class
+├── model.py              # Transformer model
+├── training.py           # Training code
+├── renderer.py           # Document rendering
+├── generator.py          # Synthetic data generation
+├── cli.py                # Command-line interface
+└── detector/             # Text detection
+    ├── base.py
+    ├── db/               # DB detector
+    └── craft/            # CRAFT detector
 ```
 
 ---
@@ -523,9 +502,9 @@ If you find this project useful:
 
 ```bibtex
 @software{kiri_ocr,
-  author = {MRTMOB},
+  author = {mrrtmob},
   title = {Kiri OCR: Lightweight Khmer and English OCR},
-  year = {2024},
+  year = {2026},
   url = {https://github.com/mrrtmob/kiri-ocr}
 }
 ```

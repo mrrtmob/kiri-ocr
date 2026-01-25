@@ -1,168 +1,126 @@
+# kiri_ocr/training.py
+"""
+KiriOCR Transformer Training Module.
+
+This module contains training code for the main Transformer OCR model
+using hybrid CTC + attention decoder loss.
+"""
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import OneCycleLR
 from PIL import Image
-import numpy as np
-import os
-import matplotlib.pyplot as plt
-from pathlib import Path
 from tqdm import tqdm
+from pathlib import Path
+import numpy as np
+import json
+import math
 
 try:
     from datasets import load_dataset
 except ImportError:
     load_dataset = None
 
-from .model import LightweightOCR, CharacterSet, save_checkpoint
+try:
+    from safetensors.torch import save_file, load_file
+    HAS_SAFETENSORS = True
+except ImportError:
+    HAS_SAFETENSORS = False
+    print("⚠️ safetensors not installed. Using torch.save instead.")
+
+from .model import KiriOCR, CFG, CharTokenizer, greedy_ctc_decode
 
 
-# ========== DATASET ==========
-class OCRDataset(Dataset):
-    def __init__(self, labels_file, charset, img_height=32):
-        self.img_height = img_height
-        self.charset = charset
-        self.samples = []
+# ========== VOCAB BUILDERS ==========
+def build_vocab_from_hf_dataset(dataset, output_path, text_col="text"):
+    """Scans a HF dataset to create vocab_char.json automatically."""
+    print(f"📖 Scanning HF Dataset to build vocabulary...")
+    unique_chars = set()
 
-        labels_path = Path(labels_file)
-        self.img_dir = labels_path.parent / "images"
+    try:
+        iter_ds = dataset.select_columns([text_col])
+    except:
+        iter_ds = dataset
 
+    for item in tqdm(iter_ds, desc="Scanning Vocab"):
+        text = item.get(text_col, "")
+        if text:
+            unique_chars.update(list(text))
+
+    print(f"   Found {len(unique_chars)} unique characters.")
+
+    sorted_chars = sorted(list(unique_chars))
+    vocab = {"<unk>": 0}
+    idx = 1
+    for char in sorted_chars:
+        if char != "<unk>":
+            vocab[char] = idx
+            idx += 1
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(vocab, f, indent=2, ensure_ascii=False)
+
+    print(f"✅ Generated vocabulary saved to: {output_path}")
+    return output_path
+
+
+def build_vocab_from_dataset(labels_file, output_path):
+    """Scans the training file and creates a vocab_char.json automatically."""
+    print(f"📖 Scanning {labels_file} to build vocabulary...")
+    unique_chars = set()
+
+    try:
         with open(labels_file, "r", encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split("\t")
-                if len(parts) == 2:
-                    img_name, text = parts
-                    charset.add_chars(text)
-                    self.samples.append((img_name, text))
+                if len(parts) >= 2:
+                    text = parts[1]
+                    unique_chars.update(list(text))
+    except Exception as e:
+        print(f"❌ Error reading labels file: {e}")
+        return None
 
-        print(f"  Loaded {len(self.samples)} samples")
+    print(f"   Found {len(unique_chars)} unique characters.")
+    sorted_chars = sorted(list(unique_chars))
 
-    def __len__(self):
-        return len(self.samples)
+    vocab = {"<unk>": 0}
+    idx = 1
+    for char in sorted_chars:
+        if char != "<unk>":
+            vocab[char] = idx
+            idx += 1
 
-    def __getitem__(self, idx):
-        img_name, text = self.samples[idx]
-        img_path = self.img_dir / img_name
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(vocab, f, indent=2, ensure_ascii=False)
 
-        img = Image.open(img_path).convert("L")
-
-        # Resize maintaining aspect ratio
-        w, h = img.size
-        new_h = self.img_height
-        new_w = int(w * new_h / h)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-
-        # Normalize
-        img = np.array(img).astype(np.float32) / 255.0
-        img = torch.FloatTensor(img).unsqueeze(0)
-
-        target = self.charset.encode(text)
-        target = torch.LongTensor(target)
-
-        return img, target, text
+    print(f"✅ Generated vocabulary saved to: {output_path}")
+    return output_path
 
 
-class HFIterableOCRDataset(IterableDataset):
+# ========== DATASET WITH BOTH CTC AND DECODER TARGETS ==========
+class HFTransformerDataset(Dataset):
+    """Dataset that returns both CTC and decoder targets"""
+
     def __init__(
-        self, dataset, charset, img_height=32, image_col="image", text_col="text"
+        self,
+        dataset,
+        tokenizer,
+        img_height=48,
+        img_width=640,
+        image_col="image",
+        text_col="text",
     ):
         if load_dataset is None:
-            raise ImportError("Please install 'datasets' library: pip install datasets")
+            raise ImportError("Please install 'datasets' library")
 
+        self.dataset = dataset
+        self.tokenizer = tokenizer
         self.img_height = img_height
-        self.charset = charset
+        self.img_width = img_width
         self.image_col = image_col
         self.text_col = text_col
-        self.dataset = dataset
-
-        # Iterate to build charset if needed
-        if len(charset) < 10:
-            print(f"  🔄 Scanning charset from '{text_col}' column (Streaming)...")
-            count = 0
-            # Scan first 5000 samples for safety
-            max_scan = 5000
-            for i, item in enumerate(dataset):
-                if i >= max_scan:
-                    break
-                text = item.get(text_col, "")
-                if text:
-                    charset.add_chars(text)
-                count += 1
-                if count % 100 == 0:
-                    print(f"    Scanned {count} samples...", end='\r')
-            print(f"    Scanned {count} samples. Done.")
-        else:
-            print(f"  ℹ️  Skipping charset scan (charset already has {len(charset)} chars)")
-
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        ds = self.dataset
-        if worker_info is not None:
-             if hasattr(ds, 'shard'):
-                 try:
-                    ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
-                 except:
-                    pass
-        
-        for item in ds:
-            try:
-                img = item[self.image_col]
-                text = item[self.text_col]
-
-                if img.mode != "L":
-                    img = img.convert("L")
-
-                w, h = img.size
-                new_h = self.img_height
-                new_w = int(w * new_h / h)
-                img = img.resize((new_w, new_h), Image.LANCZOS)
-
-                img = np.array(img).astype(np.float32) / 255.0
-                img = torch.FloatTensor(img).unsqueeze(0)
-
-                target = self.charset.encode(text)
-                target = torch.LongTensor(target)
-
-                yield img, target, text
-            except Exception:
-                continue
-
-
-class HFOCRDataset(Dataset):
-    def __init__(
-        self, dataset, charset, img_height=32, image_col="image", text_col="text"
-    ):
-        if load_dataset is None:
-            raise ImportError("Please install 'datasets' library: pip install datasets")
-
-        self.img_height = img_height
-        self.charset = charset
-        self.image_col = image_col
-        self.text_col = text_col
-        self.dataset = dataset
-
-        # Iterate to build charset
-        print(f"  🔄 Scanning charset from '{text_col}' column...")
-        if text_col not in self.dataset.column_names:
-            raise ValueError(
-                f"Column '{text_col}' not found in dataset. Available: {self.dataset.column_names}"
-            )
-
-        # Optimize: select only text column to avoid decoding images during scan
-        try:
-            iter_ds = self.dataset.select_columns([text_col])
-        except:
-            iter_ds = self.dataset
-
-        for item in tqdm(iter_ds, desc="Scanning charset"):
-            text = item.get(text_col, "")
-            if text:
-                charset.add_chars(text)
-        
-        # Clear memory
-        del iter_ds
-        import gc
-        gc.collect()
 
     def __len__(self):
         return len(self.dataset)
@@ -172,437 +130,687 @@ class HFOCRDataset(Dataset):
         img = item[self.image_col]
         text = item[self.text_col]
 
-        if img.mode != "L":
-            img = img.convert("L")
+        try:
+            # Image preprocessing
+            if img.mode != "L":
+                img = img.convert("L")
 
-        # Resize maintaining aspect ratio
-        w, h = img.size
-        new_h = self.img_height
-        new_w = int(w * new_h / h)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
+            w, h = img.size
+            new_w = int(w * self.img_height / h)
+            img = img.resize((new_w, self.img_height), Image.BILINEAR)
 
-        # Normalize
-        img = np.array(img).astype(np.float32) / 255.0
-        img = torch.FloatTensor(img).unsqueeze(0)
+            final_img = Image.new("L", (self.img_width, self.img_height), 128)
+            paste_w = min(new_w, self.img_width)
+            final_img.paste(img.crop((0, 0, paste_w, self.img_height)), (0, 0))
 
-        target = self.charset.encode(text)
-        target = torch.LongTensor(target)
+            img_tensor = torch.from_numpy(np.array(final_img)).float() / 255.0
+            img_tensor = (img_tensor - 0.5) / 0.5
+            img_tensor = img_tensor.unsqueeze(0)
 
-        return img, target, text
+            # ========== DECODER TARGETS ==========
+            # [BOS, char1+offset, char2+offset, ..., EOS]
+            dec_ids = []
+            for c in text:
+                raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
+                dec_ids.append(raw_id + self.tokenizer.dec_offset)
+            dec_ids = [self.tokenizer.dec_bos] + dec_ids + [self.tokenizer.dec_eos]
+
+            # ========== CTC TARGETS ==========
+            # [char1+ctc_offset, char2+ctc_offset, ...] (no BOS/EOS)
+            ctc_ids = []
+            for c in text:
+                raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
+                ctc_ids.append(raw_id + self.tokenizer.ctc_offset)
+
+            return {
+                "image": img_tensor,
+                "dec_target": torch.LongTensor(dec_ids),
+                "ctc_target": torch.LongTensor(ctc_ids),
+                "ctc_target_len": len(ctc_ids),
+                "text": text,
+            }
+
+        except Exception as e:
+            print(f"Error loading sample {idx}: {e}")
+            return {
+                "image": torch.zeros(1, self.img_height, self.img_width),
+                "dec_target": torch.LongTensor([1, 2]),  # BOS, EOS
+                "ctc_target": torch.LongTensor([]),
+                "ctc_target_len": 0,
+                "text": "",
+            }
+
+
+class TransformerDataset(Dataset):
+    """Local dataset that returns both CTC and decoder targets"""
+
+    def __init__(self, labels_file, tokenizer, img_height=48, img_width=640):
+        self.samples = []
+        self.tokenizer = tokenizer
+        self.img_height = img_height
+        self.img_width = img_width
+
+        labels_path = Path(labels_file)
+        possible_img_dirs = [
+            labels_path.parent / "images",
+            labels_path.parent,
+        ]
+
+        with open(labels_file, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:
+                    img_name = parts[0]
+                    text = parts[1]
+
+                    for img_dir in possible_img_dirs:
+                        img_path = img_dir / img_name
+                        if img_path.exists():
+                            self.samples.append((str(img_path), text))
+                            break
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, text = self.samples[idx]
+
+        try:
+            img = Image.open(img_path).convert("L")
+            w, h = img.size
+            new_w = int(w * self.img_height / h)
+            img = img.resize((new_w, self.img_height), Image.BILINEAR)
+
+            final_img = Image.new("L", (self.img_width, self.img_height), 128)
+            paste_w = min(new_w, self.img_width)
+            final_img.paste(img.crop((0, 0, paste_w, self.img_height)), (0, 0))
+
+            img_tensor = torch.from_numpy(np.array(final_img)).float() / 255.0
+            img_tensor = (img_tensor - 0.5) / 0.5
+            img_tensor = img_tensor.unsqueeze(0)
+
+            # Decoder targets
+            dec_ids = []
+            for c in text:
+                raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
+                dec_ids.append(raw_id + self.tokenizer.dec_offset)
+            dec_ids = [self.tokenizer.dec_bos] + dec_ids + [self.tokenizer.dec_eos]
+
+            # CTC targets
+            ctc_ids = []
+            for c in text:
+                raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
+                ctc_ids.append(raw_id + self.tokenizer.ctc_offset)
+
+            return {
+                "image": img_tensor,
+                "dec_target": torch.LongTensor(dec_ids),
+                "ctc_target": torch.LongTensor(ctc_ids),
+                "ctc_target_len": len(ctc_ids),
+                "text": text,
+            }
+
+        except Exception as e:
+            print(f"Error loading {img_path}: {e}")
+            return {
+                "image": torch.zeros(1, self.img_height, self.img_width),
+                "dec_target": torch.LongTensor([1, 2]),
+                "ctc_target": torch.LongTensor([]),
+                "ctc_target_len": 0,
+                "text": "",
+            }
 
 
 def collate_fn(batch):
-    images, targets, texts = zip(*batch)
+    """Collate function that handles both CTC and decoder targets"""
+    images = torch.stack([item["image"] for item in batch])
+    texts = [item["text"] for item in batch]
 
-    max_width = max([img.size(2) for img in images])
-    batch_size = len(images)
-    height = images[0].size(1)
+    # Decoder targets (padded)
+    dec_targets = [item["dec_target"] for item in batch]
+    max_dec_len = max(len(t) for t in dec_targets)
+    dec_padded = torch.zeros((len(batch), max_dec_len), dtype=torch.long)
+    for i, t in enumerate(dec_targets):
+        dec_padded[i, : len(t)] = t
 
-    padded_images = torch.zeros(batch_size, 1, height, max_width)
+    # CTC targets (concatenated)
+    ctc_targets = torch.cat([item["ctc_target"] for item in batch])
+    ctc_target_lens = torch.LongTensor([item["ctc_target_len"] for item in batch])
 
-    for i, img in enumerate(images):
-        w = img.size(2)
-        padded_images[i, :, :, :w] = img
+    return {
+        "images": images,
+        "dec_targets": dec_padded,
+        "ctc_targets": ctc_targets,
+        "ctc_target_lens": ctc_target_lens,
+        "texts": texts,
+    }
 
-    target_lengths = torch.LongTensor([len(t) for t in targets])
-    targets_concat = torch.cat(targets)
 
-    return padded_images, targets_concat, target_lengths, texts
+# ========== TRAINING LOOP WITH CTC + DECODER LOSS ==========
+def train_command(args):
+    print("=" * 60)
+    print("  🚀 KiriOCR Transformer Training")
+    print("=" * 60)
 
+    device = args.device if torch.cuda.is_available() else "cpu"
+    os.makedirs(args.output_dir, exist_ok=True)
 
-def train_model(
-    model,
-    train_loader,
-    val_loader,
-    charset,
-    num_epochs=200,
-    device="cuda",
-    save_dir="models",
-    lr=0.001,
-    weight_decay=0.0001,
-):
-    os.makedirs(save_dir, exist_ok=True)
+    # ========== 1. VOCAB ==========
+    vocab_path = getattr(args, "vocab", None)
+    hf_ds_train = None
+    hf_ds_val = None
 
-    model = model.to(device)
-    criterion = nn.CTCLoss(blank=0, zero_infinity=True)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10
+    if hasattr(args, "hf_dataset") and args.hf_dataset:
+        print(f"\n📥 Loading HF dataset: {args.hf_dataset}")
+        subset = getattr(args, "hf_subset", None)
+        try:
+            hf_ds_train = load_dataset(
+                args.hf_dataset, subset, split=args.hf_train_split
+            )
+
+            # Try to load validation split
+            val_splits = [
+                getattr(args, "hf_val_split", None),
+                "validation",
+                "val",
+                "test",
+            ]
+            for split in val_splits:
+                if split:
+                    try:
+                        hf_ds_val = load_dataset(args.hf_dataset, subset, split=split)
+                        print(f"   ✓ Found validation split: {split}")
+                        break
+                    except:
+                        pass
+        except Exception as e:
+            print(f"❌ Error loading dataset: {e}")
+            return
+
+    if not vocab_path or not os.path.exists(vocab_path):
+        generated_vocab_path = os.path.join(args.output_dir, "vocab.json")
+
+        if hf_ds_train:
+            vocab_path = build_vocab_from_hf_dataset(
+                hf_ds_train, generated_vocab_path, text_col=args.hf_text_col
+            )
+        elif hasattr(args, "train_labels") and args.train_labels:
+            if os.path.exists(args.train_labels):
+                vocab_path = build_vocab_from_dataset(
+                    args.train_labels, generated_vocab_path
+                )
+            else:
+                print(f"❌ Train labels not found: {args.train_labels}")
+                return
+        else:
+            print("❌ No dataset provided")
+            return
+
+        if vocab_path is None:
+            return
+
+    # ========== 2. CONFIG & TOKENIZER ==========
+    cfg = CFG()
+    cfg.IMG_H = getattr(args, "height", 48)
+    cfg.IMG_W = getattr(args, "width", 640)
+
+    try:
+        tokenizer = CharTokenizer(vocab_path, cfg)
+        print(f"\n📝 Vocabulary: {tokenizer.vocab_size} characters")
+        print(f"   CTC classes: {tokenizer.ctc_classes}")
+        print(f"   Decoder vocab: {tokenizer.dec_vocab}")
+    except Exception as e:
+        print(f"❌ Error loading tokenizer: {e}")
+        return
+
+    # ========== 3. MODEL ==========
+    model = KiriOCR(cfg, tokenizer).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"\n🏗️  Model: {total_params:,} parameters ({total_params * 4 / 1024 / 1024:.1f} MB)"
     )
 
-    best_loss = float("inf")
-    best_acc = 0
-
-    print("\n" + "=" * 70)
-    print("  🚀 Training Lightweight OCR")
-    print("=" * 70)
-
-    history = {"train_loss": [], "val_loss": [], "acc": []}
-
-    for epoch in range(num_epochs):
-        # Training
-        model.train()
-        train_loss = 0
-
-        # Progress bar for training
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
-
-        for batch_idx, (images, targets, target_lengths, texts) in enumerate(pbar):
-            images = images.to(device)
-            targets = targets.to(device)
-            target_lengths = target_lengths.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-
-            input_lengths = torch.full(
-                size=(outputs.size(1),),
-                fill_value=outputs.size(0),
-                dtype=torch.long,
-                device=device,
-            )
-
-            log_probs = nn.functional.log_softmax(outputs, dim=2)
-            loss = criterion(log_probs, targets, input_lengths, target_lengths)
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-
-            train_loss += loss.item()
-
-            # Update progress bar
-            pbar.set_postfix({"loss": loss.item()})
-
-        train_loss /= len(train_loader)
-
-        # Validation
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-
-        if len(val_loader) > 0:
-            with torch.no_grad():
-                for images, targets, target_lengths, texts in val_loader:
-                    images = images.to(device)
-                    targets = targets.to(device)
-                    target_lengths = target_lengths.to(device)
-
-                    outputs = model(images)
-
-                    input_lengths = torch.full(
-                        size=(outputs.size(1),),
-                        fill_value=outputs.size(0),
-                        dtype=torch.long,
-                        device=device,
-                    )
-
-                    log_probs = nn.functional.log_softmax(outputs, dim=2)
-                    loss = criterion(log_probs, targets, input_lengths, target_lengths)
-                    val_loss += loss.item()
-
-                    # Accuracy
-                    _, preds = outputs.max(2)
-                    preds = preds.transpose(0, 1)
-
-                    for i, text in enumerate(texts):
-                        pred_indices = preds[i].cpu().numpy()
-                        pred_text = charset.decode(pred_indices)
-                        if pred_text == text:
-                            correct += 1
-                        total += 1
-
-            val_loss /= len(val_loader)
-            accuracy = correct / total * 100 if total > 0 else 0
-        else:
-            val_loss = 0
-            accuracy = 0
-
-        scheduler.step(val_loss)
-
-        print(
-            f"Epoch [{epoch+1:3d}/{num_epochs}] "
-            f"Train: {train_loss:.4f} | "
-            f"Val: {val_loss:.4f} | "
-            f"Acc: {accuracy:5.2f}%"
-        )
-
-        # Store history
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["acc"].append(accuracy)
-
-        # Save checkpoint every epoch
-        save_checkpoint(
-            model,
-            charset,
-            optimizer,
-            epoch + 1,
-            val_loss,
-            accuracy,
-            f"{save_dir}/checkpoint_epoch_{epoch+1}.kiri",
-        )
-
-        # Save best model
-        if accuracy > best_acc or (accuracy == best_acc and val_loss < best_loss):
-            best_loss = val_loss
-            best_acc = accuracy
-
-            save_checkpoint(
-                model,
-                charset,
-                optimizer,
-                epoch + 1,
-                val_loss,
-                accuracy,
-                f"{save_dir}/model.kiri",
-            )
-            print(f"  ✓ Saved Best! Acc: {accuracy:.2f}%")
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-    # Plot history
-    try:
-        plt.figure(figsize=(12, 5))
-
-        plt.subplot(1, 2, 1)
-        plt.plot(history["train_loss"], label="Train Loss")
-        plt.plot(history["val_loss"], label="Val Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training Loss")
-        plt.legend()
-        plt.grid(True)
-
-        plt.subplot(1, 2, 2)
-        plt.plot(history["acc"], label="Validation Accuracy", color="green")
-        plt.xlabel("Epoch")
-        plt.ylabel("Accuracy (%)")
-        plt.title("Training Accuracy")
-        plt.legend()
-        plt.grid(True)
-
-        plt.tight_layout()
-        plt.savefig(f"{save_dir}/training_history.png")
-        print(f"\n📊 Training plot saved to {save_dir}/training_history.png")
-    except Exception as e:
-        print(f"\n⚠️ Failed to save plot: {e}")
-
-    print(f"\n🎉 Training complete! Best accuracy: {best_acc:.2f}%\n")
-
-
-def train_command(args):
-    IMAGE_HEIGHT = args.height
-    BATCH_SIZE = args.batch_size
-    NUM_EPOCHS = args.epochs
-    HIDDEN_SIZE = args.hidden_size
-
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        print("⚠️ CUDA not available, using CPU")
-        device = "cpu"
-
-    print(f"\n🖥️  Device: {device}\n")
-
-    # Load charset from pretrained model if available
-    charset = CharacterSet()
+    # Load pretrained weights if specified
     if (
         hasattr(args, "from_model")
         and args.from_model
         and os.path.exists(args.from_model)
     ):
+        print(f"   🔄 Loading weights from {args.from_model}")
         try:
-            checkpoint = torch.load(args.from_model, map_location="cpu")
-            if "charset" in checkpoint:
-                print(f"🔄 Loading charset from {args.from_model}")
-                charset = CharacterSet.from_checkpoint(checkpoint)
-        except Exception:
-            pass  # Will be handled later or just start fresh
-
-    print("📂 Loading datasets...")
-
-    train_dataset = None
-    val_dataset = None
-
-    if hasattr(args, "hf_dataset") and args.hf_dataset:
-        print(f"  ⬇️ Loading HF dataset: {args.hf_dataset}")
-        subset = getattr(args, "hf_subset", None)
-        streaming = getattr(args, "hf_streaming", False)
-
-        if streaming:
-            print("  🌊 Streaming mode enabled")
-
-        # Load train split
-        try:
-            ds = load_dataset(args.hf_dataset, subset, split=args.hf_train_split, streaming=streaming)
+            ckpt = torch.load(args.from_model, map_location="cpu", weights_only=False)
+            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            model.load_state_dict(state_dict, strict=False)
+            print("   ✓ Weights loaded")
         except Exception as e:
-            print(f"❌ Error loading dataset: {e}")
-            return
+            print(f"   ⚠️ Could not load weights: {e}")
+
+    # ========== 4. DATASETS ==========
+    print(f"\n📂 Loading datasets...")
+
+    if hf_ds_train:
+        train_ds = HFTransformerDataset(
+            hf_ds_train,
+            tokenizer,
+            img_height=cfg.IMG_H,
+            img_width=cfg.IMG_W,
+            image_col=args.hf_image_col,
+            text_col=args.hf_text_col,
+        )
+        print(f"   Train: {len(train_ds)} samples")
 
         val_ds = None
-        # Try finding val split
-        val_splits = (
-            [args.hf_val_split] if args.hf_val_split else ["val", "test", "validation"]
-        )
-
-        for split in val_splits:
-            if not split:
-                continue
-            try:
-                # We check if we can load it
-                candidate = load_dataset(args.hf_dataset, subset, split=split, streaming=streaming)
-                val_ds = candidate
-                print(f"  ✓ Found validation split: '{split}'")
-                break
-            except:
-                pass
-
-        if val_ds is None:
-            if not streaming:
-                print(
-                    f"  ⚠️ No validation split found. Splitting {args.hf_val_percent*100}% from train..."
-                )
-                try:
-                    split_ds = ds.train_test_split(test_size=args.hf_val_percent)
-                    ds = split_ds["train"]
-                    val_ds = split_ds["test"]
-                except Exception as e:
-                    print(f"  ⚠️ Could not split dataset: {e}. Using train for validation.")
-                    val_ds = ds
-            else:
-                 print(f"  ⚠️ No validation split found and streaming is on. Validation will be skipped.")
-
-        if streaming:
-            train_dataset = HFIterableOCRDataset(
-                ds,
-                charset,
-                img_height=IMAGE_HEIGHT,
+        if hf_ds_val:
+            val_ds = HFTransformerDataset(
+                hf_ds_val,
+                tokenizer,
+                img_height=cfg.IMG_H,
+                img_width=cfg.IMG_W,
                 image_col=args.hf_image_col,
                 text_col=args.hf_text_col,
             )
-            val_dataset = HFIterableOCRDataset(
-                val_ds,
-                charset,
-                img_height=IMAGE_HEIGHT,
-                image_col=args.hf_image_col,
-                text_col=args.hf_text_col,
-            ) if val_ds else None
-        else:
-            train_dataset = HFOCRDataset(
-                ds,
-                charset,
-                img_height=IMAGE_HEIGHT,
-                image_col=args.hf_image_col,
-                text_col=args.hf_text_col,
-            )
-            val_dataset = HFOCRDataset(
-                val_ds,
-                charset,
-                img_height=IMAGE_HEIGHT,
-                image_col=args.hf_image_col,
-                text_col=args.hf_text_col,
-            )
+            print(f"   Val: {len(val_ds)} samples")
     else:
-        if not os.path.exists(args.train_labels):
-            print(f"❌ Training labels not found: {args.train_labels}")
-            return
+        train_ds = TransformerDataset(
+            args.train_labels, tokenizer, img_height=cfg.IMG_H, img_width=cfg.IMG_W
+        )
+        print(f"   Train: {len(train_ds)} samples")
 
-        train_dataset = OCRDataset(args.train_labels, charset, img_height=IMAGE_HEIGHT)
-
-        if args.val_labels and os.path.exists(args.val_labels):
-            val_dataset = OCRDataset(args.val_labels, charset, img_height=IMAGE_HEIGHT)
-        else:
-            print(
-                f"⚠️ Validation labels not found. Using training set for validation (not recommended)."
+        val_ds = None
+        if (
+            hasattr(args, "val_labels")
+            and args.val_labels
+            and os.path.exists(args.val_labels)
+        ):
+            val_ds = TransformerDataset(
+                args.val_labels, tokenizer, img_height=cfg.IMG_H, img_width=cfg.IMG_W
             )
-            val_dataset = train_dataset
+            print(f"   Val: {len(val_ds)} samples")
 
-    train_len = len(train_dataset) if hasattr(train_dataset, "__len__") else "Unknown (Streaming)"
-    val_len = len(val_dataset) if val_dataset and hasattr(val_dataset, "__len__") else ("Unknown (Streaming)" if val_dataset else 0)
-    print(f"\n📊 Dataset: {train_len} train, {val_len} val")
-    print(f"📝 Characters: {len(charset)}\n")
-    
-    # Clear memory before training
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if len(train_ds) == 0:
+        print("❌ No training samples found!")
+        return
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    # charset.save(f'{args.output_dir}/charset_lite.txt') # Not needed if using .kiri
-
-    # shuffle=True is not supported for IterableDataset
-    is_iterable = isinstance(train_dataset, IterableDataset)
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=not is_iterable,
-        num_workers=4 if device == "cuda" else 0,
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
         collate_fn=collate_fn,
+        num_workers=4 if device == "cuda" else 0,
+        pin_memory=(device == "cuda"),
     )
-    if val_dataset:
+
+    val_loader = None
+    if val_ds:
         val_loader = DataLoader(
-            val_dataset,
-            batch_size=BATCH_SIZE,
+            val_ds,
+            batch_size=args.batch_size,
             shuffle=False,
-            num_workers=4 if device == "cuda" else 0,
             collate_fn=collate_fn,
+            num_workers=4 if device == "cuda" else 0,
         )
-    else:
-        val_loader = []
 
-    model = LightweightOCR(num_chars=len(charset), hidden_size=HIDDEN_SIZE)
+    # ========== 5. LOSSES ==========
+    # CTC Loss (for encoder)
+    ctc_criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
 
-    # Load pretrained model if specified
-    if hasattr(args, "from_model") and args.from_model:
-        print(f"🔄 Loading pretrained model from {args.from_model}")
-        if os.path.exists(args.from_model):
-            try:
-                checkpoint = torch.load(args.from_model, map_location=device)
-                if "model_state_dict" in checkpoint:
-                    state_dict = checkpoint["model_state_dict"]
-                    model_dict = model.state_dict()
+    # Cross-Entropy Loss (for decoder)
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.dec_pad)
 
-                    # Filter out unnecessary keys or shape mismatches
-                    pretrained_dict = {
-                        k: v
-                        for k, v in state_dict.items()
-                        if k in model_dict and v.shape == model_dict[k].shape
-                    }
+    # Loss weights
+    ctc_weight = getattr(args, "ctc_weight", 0.5)
+    dec_weight = getattr(args, "dec_weight", 0.5)
+    print(f"\n⚖️  Loss weights: CTC={ctc_weight}, Decoder={dec_weight}")
 
-                    # Log what was skipped
-                    skipped_keys = [k for k in state_dict if k not in pretrained_dict]
-                    if skipped_keys:
-                        print(
-                            f"  ⚠️ Skipped mismatched layers (fine-tuning): {skipped_keys[:5]} ..."
-                        )
-
-                    # Overwrite entries in the existing state dict
-                    model_dict.update(pretrained_dict)
-                    model.load_state_dict(model_dict)
-                    print("  ✓ Weights loaded successfully")
-                else:
-                    print("  ⚠️ Invalid checkpoint format (missing model_state_dict)")
-            except Exception as e:
-                print(f"  ❌ Error loading model: {e}")
-        else:
-            print(f"  ❌ Pretrained model not found: {args.from_model}")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    model_size_mb = total_params * 4 / 1024 / 1024
-
-    print(f"🏗️  Model: {total_params:,} params ({model_size_mb:.2f} MB)\n")
-
-    train_model(
-        model,
-        train_loader,
-        val_loader,
-        charset,
-        num_epochs=NUM_EPOCHS,
-        device=device,
-        save_dir=args.output_dir,
+    # ========== 6. OPTIMIZER & SCHEDULER ==========
+    optimizer = optim.AdamW(
+        model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
+        betas=(0.9, 0.98),
     )
+
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = min(4000, total_steps // 10)
+
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=total_steps,
+        pct_start=warmup_steps / total_steps,
+        anneal_strategy="cos",
+    )
+
+    print(f"   Optimizer: AdamW (lr={args.lr})")
+    print(f"   Scheduler: OneCycleLR (warmup={warmup_steps} steps)")
+
+    # ========== 7. RESUME ==========
+    start_epoch = 0
+    global_step = 0
+    best_val_loss = float("inf")
+
+    # Try safetensors first, then fallback to .pt
+    resume_paths = [
+        f"{args.output_dir}/latest.safetensors",
+        f"{args.output_dir}/latest.pt",
+    ]
+    
+    if getattr(args, "resume", False):
+        for resume_path in resume_paths:
+            if os.path.exists(resume_path):
+                print(f"\n🔄 Resuming from {resume_path}...")
+                try:
+                    ckpt = load_checkpoint(resume_path, device)
+                    model.load_state_dict(ckpt["model"], strict=False)
+
+                    if "optimizer" in ckpt:
+                        optimizer.load_state_dict(ckpt["optimizer"])
+                    if "scheduler" in ckpt:
+                        scheduler.load_state_dict(ckpt["scheduler"])
+                    if "epoch" in ckpt:
+                        start_epoch = ckpt["epoch"]
+                    if "step" in ckpt:
+                        global_step = ckpt["step"]
+                    if "best_val_loss" in ckpt:
+                        best_val_loss = ckpt["best_val_loss"]
+
+                    print(f"   ✓ Resumed at epoch {start_epoch}, step {global_step}")
+                    break
+                except Exception as e:
+                    print(f"   ⚠️ Resume failed: {e}")
+
+    # ========== 8. TRAINING LOOP ==========
+    print(f"\n" + "=" * 60)
+    print(f"  Starting Training: {args.epochs} epochs on {device}")
+    print("=" * 60)
+
+    history = {"train_loss": [], "val_loss": [], "ctc_loss": [], "dec_loss": []}
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        epoch_loss = 0
+        epoch_ctc_loss = 0
+        epoch_dec_loss = 0
+        num_batches = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+
+        for batch in pbar:
+            imgs = batch["images"].to(device)
+            dec_tgts = batch["dec_targets"].to(device)
+            ctc_tgts = batch["ctc_targets"].to(device)
+            ctc_lens = batch["ctc_target_lens"].to(device)
+
+            optimizer.zero_grad()
+
+            # ========== ENCODER ==========
+            memory = model.encode(imgs)  # [B, T, D]
+
+            # ========== CTC LOSS ==========
+            ctc_logits = model.ctc_head(memory)  # [B, T, ctc_classes]
+            ctc_logits = ctc_logits.permute(1, 0, 2)  # [T, B, C] for CTC
+            ctc_log_probs = nn.functional.log_softmax(ctc_logits, dim=2)
+
+            input_lens = torch.full(
+                (imgs.size(0),), ctc_logits.size(0), dtype=torch.long, device=device
+            )
+
+            # Skip samples with empty targets
+            valid_mask = ctc_lens > 0
+            if valid_mask.sum() > 0:
+                ctc_loss = ctc_criterion(
+                    ctc_log_probs[:, valid_mask],
+                    ctc_tgts,
+                    input_lens[valid_mask],
+                    ctc_lens[valid_mask],
+                )
+            else:
+                ctc_loss = torch.tensor(0.0, device=device)
+
+            # ========== DECODER LOSS ==========
+            memory_proj = model.mem_proj(memory)
+
+            dec_inp = dec_tgts[:, :-1]  # [BOS, a, b, c]
+            dec_out = dec_tgts[:, 1:]  # [a, b, c, EOS]
+
+            tgt_emb = model.dec_emb(dec_inp)
+            seq_len = dec_inp.size(1)
+            tgt_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=device) * float("-inf"), diagonal=1
+            )
+
+            dec_output = model.dec(tgt=tgt_emb, memory=memory_proj, tgt_mask=tgt_mask)
+            dec_logits = model.dec_head(model.dec_ln(dec_output))
+
+            dec_loss = ce_criterion(
+                dec_logits.reshape(-1, dec_logits.size(-1)), dec_out.reshape(-1)
+            )
+
+            # ========== COMBINED LOSS ==========
+            loss = ctc_weight * ctc_loss + dec_weight * dec_loss
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            # Track
+            epoch_loss += loss.item()
+            epoch_ctc_loss += ctc_loss.item()
+            epoch_dec_loss += dec_loss.item()
+            num_batches += 1
+            global_step += 1
+
+            pbar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "ctc": f"{ctc_loss.item():.4f}",
+                    "dec": f"{dec_loss.item():.4f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                }
+            )
+
+            # Save step checkpoint
+            save_steps = getattr(args, "save_steps", 0)
+            if save_steps > 0 and global_step % save_steps == 0:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    cfg,
+                    vocab_path,
+                    epoch,
+                    global_step,
+                    best_val_loss,
+                    f"{args.output_dir}/checkpoint_step_{global_step}.safetensors",
+                )
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    cfg,
+                    vocab_path,
+                    epoch,
+                    global_step,
+                    best_val_loss,
+                    f"{args.output_dir}/latest.safetensors",
+                )
+
+        # Epoch stats
+        avg_loss = epoch_loss / max(1, num_batches)
+        avg_ctc = epoch_ctc_loss / max(1, num_batches)
+        avg_dec = epoch_dec_loss / max(1, num_batches)
+
+        history["train_loss"].append(avg_loss)
+        history["ctc_loss"].append(avg_ctc)
+        history["dec_loss"].append(avg_dec)
+
+        print(f"\n  Epoch {epoch+1} Summary:")
+        print(
+            f"    Train Loss: {avg_loss:.4f} (CTC: {avg_ctc:.4f}, Dec: {avg_dec:.4f})"
+        )
+
+        # ========== VALIDATION ==========
+        val_loss = 0
+        val_acc = 0
+
+        if val_loader:
+            model.eval()
+            val_total = 0
+            val_correct = 0
+
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc="Validating", leave=False):
+                    imgs = batch["images"].to(device)
+                    texts = batch["texts"]
+
+                    # Use CTC greedy decode for validation
+                    for i in range(imgs.size(0)):
+                        try:
+                            pred_text, conf = greedy_ctc_decode(
+                                model, imgs[i : i + 1], tokenizer, cfg
+                            )
+                            if pred_text.strip() == texts[i].strip():
+                                val_correct += 1
+                        except:
+                            pass
+                        val_total += 1
+
+            val_acc = val_correct / max(1, val_total) * 100
+            print(f"    Val Accuracy: {val_acc:.2f}% ({val_correct}/{val_total})")
+
+            history["val_loss"].append(val_acc)
+
+        # Save epoch checkpoint
+        save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            cfg,
+            vocab_path,
+            epoch + 1,
+            global_step,
+            best_val_loss,
+            f"{args.output_dir}/model_epoch_{epoch+1}.safetensors",
+        )
+        save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            cfg,
+            vocab_path,
+            epoch + 1,
+            global_step,
+            best_val_loss,
+            f"{args.output_dir}/latest.safetensors",
+        )
+
+        # Save best model
+        if val_loader and val_acc > best_val_loss:
+            best_val_loss = val_acc
+            save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                cfg,
+                vocab_path,
+                epoch + 1,
+                global_step,
+                best_val_loss,
+                f"{args.output_dir}/model.safetensors",
+            )
+            print(f"    ✓ New best model! Acc: {val_acc:.2f}%")
+
+        print()
+
+    # Save training history
+    with open(f"{args.output_dir}/history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    print("=" * 60)
+    print(f"  ✅ Training Complete!")
+    print(f"     Models saved to: {args.output_dir}")
+    print("=" * 60)
+
+
+def save_checkpoint(
+    model, optimizer, scheduler, cfg, vocab_path, epoch, step, best_val_loss, path
+):
+    """Save checkpoint in safetensors format with metadata JSON"""
+    if HAS_SAFETENSORS and path.endswith('.safetensors'):
+        # Save model weights as safetensors
+        save_file(model.state_dict(), path)
+        
+        # Save metadata and optimizer state as JSON
+        metadata_path = path.replace('.safetensors', '_meta.json')
+        metadata = {
+            "vocab_path": str(vocab_path),
+            "epoch": epoch,
+            "step": step,
+            "best_val_loss": best_val_loss,
+            "config": {
+                "IMG_H": cfg.IMG_H,
+                "IMG_W": cfg.IMG_W,
+                "USE_CTC": cfg.USE_CTC,
+                "USE_FP16": cfg.USE_FP16,
+            }
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Save optimizer/scheduler state separately (torch format for complex state)
+        optim_path = path.replace('.safetensors', '_optim.pt')
+        torch.save({
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        }, optim_path)
+    else:
+        # Fallback to torch.save
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "config": cfg,
+                "vocab_path": vocab_path,
+                "epoch": epoch,
+                "step": step,
+                "best_val_loss": best_val_loss,
+            },
+            path,
+        )
+
+
+def load_checkpoint(path, device="cpu"):
+    """Load checkpoint from safetensors or pt format"""
+    if path.endswith('.safetensors') and HAS_SAFETENSORS:
+        # Load model weights
+        model_state = load_file(path, device=device)
+        
+        # Load metadata
+        metadata_path = path.replace('.safetensors', '_meta.json')
+        metadata = {}
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+        
+        # Load optimizer state
+        optim_path = path.replace('.safetensors', '_optim.pt')
+        optim_state = {}
+        if os.path.exists(optim_path):
+            optim_state = torch.load(optim_path, map_location=device, weights_only=False)
+        
+        return {
+            "model": model_state,
+            "optimizer": optim_state.get("optimizer"),
+            "scheduler": optim_state.get("scheduler"),
+            "vocab_path": metadata.get("vocab_path", ""),
+            "epoch": metadata.get("epoch", 0),
+            "step": metadata.get("step", 0),
+            "best_val_loss": metadata.get("best_val_loss", float("inf")),
+            "config": metadata.get("config", {}),
+        }
+    else:
+        # Load torch checkpoint
+        return torch.load(path, map_location=device, weights_only=False)

@@ -1,4 +1,7 @@
 # kiri_ocr/core.py
+"""
+Core OCR class for Kiri OCR using Transformer architecture.
+"""
 import torch
 import cv2
 import numpy as np
@@ -7,8 +10,13 @@ from PIL import Image
 from pathlib import Path
 import json
 
-from .model import LightweightOCR, CharacterSet
-from .model_transformer import (
+try:
+    from safetensors.torch import load_file
+    HAS_SAFETENSORS = True
+except ImportError:
+    HAS_SAFETENSORS = False
+
+from .model import (
     KiriOCR,
     CFG,
     CharTokenizer,
@@ -19,7 +27,7 @@ from .model_transformer import (
 
 
 class OCR:
-    """Complete Document OCR System with Padding"""
+    """Complete Document OCR System with Transformer Model"""
 
     _model_cache = {}
 
@@ -29,21 +37,18 @@ class OCR:
         det_model_path=None,
         det_method="db",
         det_conf_threshold=0.5,
-        charset_path="models/charset_lite.txt",
-        language="mixed",
         padding=10,
         device="cpu",
         verbose=False,
         use_beam_search=True,
         use_fp16=None,
-    ):  # NEW: option to disable beam search
+    ):
         """
         Args:
-            model_path: Path to trained model (.kiri or .pth) or HuggingFace repo
-            det_model_path: Path to YOLO detector model (optional)
-            det_conf_threshold: Confidence threshold for YOLO detector
-            charset_path: Path to character set (for legacy models)
-            language: 'english', 'khmer', or 'mixed'
+            model_path: Path to trained model (.safetensors or .pt) or HuggingFace repo
+            det_model_path: Path to detector model (optional)
+            det_method: Detection method ('db', 'craft', 'yolo')
+            det_conf_threshold: Confidence threshold for detector
             padding: Pixels to pad around detected boxes
             device: 'cpu' or 'cuda'
             verbose: Print loading info
@@ -52,7 +57,6 @@ class OCR:
         """
         self.device = device
         self.verbose = verbose
-        self.language = language
         self.padding = padding
         self.det_model_path = det_model_path
         self.det_method = det_method
@@ -60,13 +64,10 @@ class OCR:
         self.use_beam_search = use_beam_search
         self.use_fp16 = use_fp16
 
-        # Transformer-specific
-        self.is_transformer = False
-        self.transformer_cfg = None
-        self.transformer_tok = None
-
-        # Legacy model
-        self.charset = None
+        # Transformer model components
+        self.cfg = None
+        self.tokenizer = None
+        self.model = None
 
         # Store repo_id for detector lazy loading
         self.repo_id = None
@@ -77,7 +78,7 @@ class OCR:
         model_path = self._resolve_model_path(model_path)
 
         # Load model
-        self._load_model(model_path, charset_path)
+        self._load_model(model_path)
 
         # Lazy-loaded detector
         self._detector = None
@@ -114,20 +115,20 @@ class OCR:
                 except:
                     pass
 
-                # Try downloading vocab.json (user requested) or vocab_auto.json
-                try:
-                    hf_hub_download(repo_id=model_path, filename="vocab.json")
-                except:
+                # Try downloading vocab.json or vocab_auto.json
+                for vocab_name in ["vocab.json", "vocab_auto.json"]:
                     try:
-                        hf_hub_download(repo_id=model_path, filename="vocab_auto.json")
+                        hf_hub_download(repo_id=model_path, filename=vocab_name)
+                        break
                     except:
                         pass
 
-                # Try downloading model.pt (user requested) or fallback to model.kiri
-                try:
-                    return hf_hub_download(repo_id=model_path, filename="model.pt")
-                except:
-                    return hf_hub_download(repo_id=model_path, filename="model.kiri")
+                # Try downloading model (safetensors first, then pt)
+                for model_name in ["model.safetensors", "model.pt"]:
+                    try:
+                        return hf_hub_download(repo_id=model_path, filename=model_name)
+                    except:
+                        pass
 
             except Exception as e:
                 if self.verbose:
@@ -135,8 +136,8 @@ class OCR:
 
         return model_path  # Return as-is, let load fail with clear error
 
-    def _load_model(self, model_path, charset_path):
-        """Load model from checkpoint"""
+    def _load_model(self, model_path):
+        """Load Transformer model from checkpoint (safetensors or pt)"""
         cache_key = (str(model_path), self.device)
 
         if cache_key in OCR._model_cache:
@@ -144,101 +145,99 @@ class OCR:
                 print(f"⚡ Loading from memory cache")
             cached = OCR._model_cache[cache_key]
             self.model = cached["model"]
-            self.is_transformer = cached["is_transformer"]
-            if self.is_transformer:
-                self.transformer_cfg = cached["cfg"]
-                self.transformer_tok = cached["tok"]
-            else:
-                self.charset = cached["charset"]
+            self.cfg = cached["cfg"]
+            self.tokenizer = cached["tokenizer"]
             return
 
         if self.verbose:
             print(f"📦 Loading OCR model from {model_path}...")
 
         try:
-            checkpoint = torch.load(
-                model_path, map_location=self.device, weights_only=False
-            )
-
-            # Detect model type
-            if self._is_transformer_checkpoint(checkpoint):
-                self._load_transformer_model(checkpoint, model_path)
+            is_safetensors = model_path.endswith('.safetensors')
+            
+            if is_safetensors and HAS_SAFETENSORS:
+                # Load safetensors format
+                state_dict = load_file(model_path, device=self.device)
+                
+                # Load metadata from JSON file
+                metadata_path = model_path.replace('.safetensors', '_meta.json')
+                self.cfg = CFG()
+                vocab_path = ""
+                
+                if Path(metadata_path).exists():
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    vocab_path = metadata.get("vocab_path", "")
+                    config_data = metadata.get("config", {})
+                    if config_data:
+                        self.cfg.IMG_H = config_data.get("IMG_H", self.cfg.IMG_H)
+                        self.cfg.IMG_W = config_data.get("IMG_W", self.cfg.IMG_W)
+                        self.cfg.USE_CTC = config_data.get("USE_CTC", self.cfg.USE_CTC)
+                        self.cfg.USE_FP16 = config_data.get("USE_FP16", self.cfg.USE_FP16)
             else:
-                self._load_legacy_model(checkpoint, charset_path)
+                # Load torch checkpoint
+                checkpoint = torch.load(
+                    model_path, map_location=self.device, weights_only=False
+                )
+
+                # Extract config and state dict
+                if "config" in checkpoint:
+                    config_data = checkpoint["config"]
+                    # Convert dict to CFG object if needed
+                    if isinstance(config_data, dict):
+                        self.cfg = CFG()
+                        self.cfg.IMG_H = config_data.get("IMG_H", self.cfg.IMG_H)
+                        self.cfg.IMG_W = config_data.get("IMG_W", self.cfg.IMG_W)
+                        self.cfg.USE_CTC = config_data.get("USE_CTC", self.cfg.USE_CTC)
+                        self.cfg.USE_FP16 = config_data.get("USE_FP16", self.cfg.USE_FP16)
+                    else:
+                        self.cfg = config_data
+                    state_dict = checkpoint["model"]
+                    vocab_path = checkpoint.get("vocab_path", "")
+                else:
+                    self.cfg = CFG()
+                    state_dict = checkpoint
+                    vocab_path = ""
+
+            # Override FP16 setting if requested
+            if self.use_fp16 is not None:
+                self.cfg.USE_FP16 = self.use_fp16
+
+            # Find vocab file
+            vocab_path = self._find_vocab_file(vocab_path, model_path)
+
+            if not vocab_path or not Path(vocab_path).exists():
+                raise FileNotFoundError(
+                    f"Could not find vocabulary file for model. "
+                    f"Expected near: {model_path}"
+                )
+
+            self.tokenizer = CharTokenizer(vocab_path, self.cfg)
+            self.model = KiriOCR(self.cfg, self.tokenizer).to(self.device)
+            self.model.load_state_dict(state_dict, strict=True)
+            self.model.eval()
+
+            if self.cfg.USE_FP16 and self.device == "cuda":
+                self.model.half()
+
+            if self.verbose:
+                print(f"  ✓ Loaded (Vocab: {self.tokenizer.vocab_size} chars)")
 
             # Cache
             OCR._model_cache[cache_key] = {
                 "model": self.model,
-                "is_transformer": self.is_transformer,
-                "cfg": self.transformer_cfg,
-                "tok": self.transformer_tok,
-                "charset": self.charset,
+                "cfg": self.cfg,
+                "tokenizer": self.tokenizer,
             }
 
         except RuntimeError as e:
             if "size mismatch" in str(e):
-                print(f"\n❌ Model/charset size mismatch: {e}")
+                print(f"\n❌ Model/vocab size mismatch: {e}")
                 sys.exit(1)
             raise
 
-    def _is_transformer_checkpoint(self, checkpoint):
-        """Check if checkpoint is transformer model"""
-        if isinstance(checkpoint, dict):
-            # Explicit transformer checkpoint
-            if "config" in checkpoint and "vocab_path" in checkpoint:
-                return True
-            # Check for transformer layer names
-            keys = (
-                checkpoint.get("model", checkpoint).keys()
-                if isinstance(checkpoint.get("model", checkpoint), dict)
-                else checkpoint.keys()
-            )
-            return any(k.startswith(("stem.", "enc.", "pos2d.")) for k in keys)
-        return False
-
-    def _load_transformer_model(self, checkpoint, model_path):
-        """Load transformer model"""
-        if self.verbose:
-            print(f"  ✓ Detected Transformer Model")
-
-        self.is_transformer = True
-
-        # Extract config and state dict
-        if "config" in checkpoint:
-            self.transformer_cfg = checkpoint["config"]
-            state_dict = checkpoint["model"]
-            vocab_path = checkpoint.get("vocab_path", "")
-        else:
-            self.transformer_cfg = CFG()
-            state_dict = checkpoint
-            vocab_path = ""
-
-        # Override FP16 setting if requested
-        if self.use_fp16 is not None:
-            self.transformer_cfg.USE_FP16 = self.use_fp16
-
-        # Find vocab file
-        vocab_path = self._find_vocab_file(vocab_path, model_path)
-
-        if not vocab_path or not Path(vocab_path).exists():
-            raise FileNotFoundError(
-                f"Could not find vocabulary file for transformer model. "
-                f"Expected near: {model_path}"
-            )
-
-        self.transformer_tok = CharTokenizer(vocab_path, self.transformer_cfg)
-        self.model = KiriOCR(self.transformer_cfg, self.transformer_tok).to(self.device)
-        self.model.load_state_dict(state_dict, strict=True)
-        self.model.eval()
-
-        if self.transformer_cfg.USE_FP16 and self.device == "cuda":
-            self.model.half()
-
-        if self.verbose:
-            print(f"  ✓ Loaded (Vocab: {self.transformer_tok.vocab_size} chars)")
-
     def _find_vocab_file(self, vocab_path, model_path):
-        """Find vocabulary file for transformer model"""
+        """Find vocabulary file for model"""
         model_dir = Path(model_path).parent
 
         candidates = [
@@ -254,41 +253,6 @@ class OCR:
                 return str(candidate)
 
         return None
-
-    def _load_legacy_model(self, checkpoint, charset_path):
-        """Load legacy LightweightOCR model"""
-        self.is_transformer = False
-
-        # Load charset
-        if "charset" in checkpoint:
-            if self.verbose:
-                print(
-                    f"  ✓ Found embedded charset ({len(checkpoint['charset'])} chars)"
-                )
-            self.charset = CharacterSet.from_checkpoint(checkpoint)
-        else:
-            charset_file = Path(charset_path)
-            if not charset_file.exists():
-                pkg_dir = Path(__file__).parent
-                if (pkg_dir / charset_path).exists():
-                    charset_path = str(pkg_dir / charset_path)
-
-            if self.verbose:
-                print(f"  ℹ️ Loading charset from: {charset_path}")
-            self.charset = CharacterSet.load(charset_path)
-
-        # Load model
-        self.model = LightweightOCR(num_chars=len(self.charset)).eval()
-
-        if "model_state_dict" in checkpoint:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            self.model.load_state_dict(checkpoint)
-
-        self.model = self.model.to(self.device)
-
-        if self.verbose:
-            print(f"  ✓ Legacy model loaded ({len(self.charset)} chars)")
 
     @property
     def detector(self):
@@ -333,20 +297,7 @@ class OCR:
             roi = 255 - roi
 
         roi_pil = Image.fromarray(roi)
-
-        if self.is_transformer:
-            return preprocess_pil(self.transformer_cfg, roi_pil)
-        else:
-            # Legacy preprocessing
-            w, h = roi_pil.size
-            new_h = 32
-            new_w = max(32, int((w / h) * new_h))
-
-            roi_pil = roi_pil.resize((new_w, new_h), Image.LANCZOS)
-            roi_array = np.array(roi_pil) / 255.0
-            return (
-                torch.tensor(roi_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            )
+        return preprocess_pil(self.cfg, roi_pil)
 
     def recognize_single_line_image(self, image_path):
         """Recognize text from a single-line image (no detection)"""
@@ -361,18 +312,7 @@ class OCR:
             img = 255 - img
 
         img_pil = Image.fromarray(img)
-
-        if self.is_transformer:
-            img_tensor = preprocess_pil(self.transformer_cfg, img_pil)
-        else:
-            w, h = img_pil.size
-            new_h = 32
-            new_w = max(32, int((w / h) * new_h))
-            img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
-            img_array = np.array(img_pil) / 255.0
-            img_tensor = (
-                torch.tensor(img_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            )
+        img_tensor = preprocess_pil(self.cfg, img_pil)
 
         return self.recognize_region(img_tensor)
 
@@ -385,17 +325,7 @@ class OCR:
         """
         image_tensor = image_tensor.to(self.device)
 
-        if self.is_transformer:
-            return self._recognize_transformer(image_tensor)
-        else:
-            return self._recognize_legacy(image_tensor)
-
-    def _recognize_transformer(self, image_tensor):
-        """Transformer model recognition"""
-        cfg = self.transformer_cfg
-        tok = self.transformer_tok
-
-        if cfg.USE_FP16 and self.device == "cuda":
+        if self.cfg.USE_FP16 and self.device == "cuda":
             image_tensor = image_tensor.half()
 
         # Encode
@@ -404,51 +334,19 @@ class OCR:
 
         # Get CTC logits for fusion
         ctc_logits = None
-        if cfg.USE_CTC and hasattr(self.model, "ctc_head"):
+        if self.cfg.USE_CTC and hasattr(self.model, "ctc_head"):
             ctc_logits = self.model.ctc_head(mem)
 
         if self.use_beam_search:
             # Beam search (higher quality, slower)
             text, confidence = beam_decode_one_batched(
-                self.model, mem_proj, tok, cfg, ctc_logits_1=ctc_logits
+                self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
             )
         else:
             # Greedy CTC (faster, simpler)
-            text, confidence = greedy_ctc_decode(self.model, image_tensor, tok, cfg)
-
-        return text, confidence
-
-    def _recognize_legacy(self, image_tensor):
-        """Legacy LightweightOCR recognition"""
-        with torch.no_grad():
-            logits = self.model(image_tensor)
-
-            probs = torch.softmax(logits, dim=-1)
-            preds = torch.argmax(probs, dim=-1).squeeze().tolist()
-
-            if not isinstance(preds, list):
-                preds = [preds]
-
-            # CTC decode with confidence
-            char_confidences = []
-            decoded_indices = []
-            prev_idx = -1
-
-            for i, idx in enumerate(preds):
-                if idx != prev_idx:
-                    if idx > 2:  # Skip BLANK, PAD, SOS
-                        decoded_indices.append(idx)
-                        # Get confidence for this timestep
-                        conf = (
-                            probs[i, 0, idx].item()
-                            if probs.dim() == 3
-                            else probs[i, idx].item()
-                        )
-                        char_confidences.append(conf)
-                prev_idx = idx
-
-            confidence = np.mean(char_confidences) if char_confidences else 0.0
-            text = self.charset.decode(decoded_indices)
+            text, confidence = greedy_ctc_decode(
+                self.model, image_tensor, self.tokenizer, self.cfg
+            )
 
         return text, confidence
 
