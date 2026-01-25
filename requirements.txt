@@ -8,4 +8,4 @@ tqdm>=4.65.0
 matplotlib>=3.7.0
 datasets>=2.14.0
 huggingface_hub>=0.16.0
-ultralytics>=8.0.0
+safetensors>=0.4.0

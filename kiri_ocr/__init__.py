@@ -1,14 +1,23 @@
+"""
+Kiri OCR - Lightweight OCR for English and Khmer documents.
+
+Main Components:
+- OCR: Main OCR class for document processing
+- KiriOCR: Transformer-based OCR model (CNN + Transformer encoder + CTC/Attention decoder)
+- TextDetector: Text detection module
+"""
 from .core import OCR
 from .renderer import DocumentRenderer
-from .model import LightweightOCR, CharacterSet
+from .model import KiriOCR, CFG, CharTokenizer
 from .detector import TextDetector
 
-__version__ = '0.1.9'
+__version__ = '0.2.0'
 
 __all__ = [
     'OCR',
     'DocumentRenderer',
-    'LightweightOCR',
-    'CharacterSet',
+    'KiriOCR',
+    'CFG',
+    'CharTokenizer',
     'TextDetector',
 ]
