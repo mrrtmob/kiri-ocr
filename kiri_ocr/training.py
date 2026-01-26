@@ -539,7 +539,7 @@ def train_command(args):
     # ========== 7. RESUME ==========
     start_epoch = 0
     global_step = 0
-    best_val_loss = float("inf")
+    best_val_acc = 0  # Track best validation accuracy (higher is better)
 
     # Try safetensors first, then fallback to .pt
     resume_paths = [
@@ -586,11 +586,17 @@ def train_command(args):
                         start_epoch = ckpt["epoch"]
                     if ckpt.get("step") is not None:
                         global_step = ckpt["step"]
-                    if ckpt.get("best_val_loss") is not None:
-                        best_val_loss = ckpt["best_val_loss"]
+                    # Handle both old "best_val_loss" and new "best_val_acc" keys
+                    if ckpt.get("best_val_acc") is not None:
+                        best_val_acc = ckpt["best_val_acc"]
+                    elif ckpt.get("best_val_loss") is not None:
+                        # Old checkpoints used best_val_loss (which was actually accuracy)
+                        # If it's infinity, it means no best was ever saved
+                        old_val = ckpt["best_val_loss"]
+                        best_val_acc = 0 if old_val == float("inf") else old_val
 
                     print(f"   ✓ Resuming from epoch {start_epoch}, step {global_step}")
-                    print(f"   ✓ Best val metric so far: {best_val_loss}")
+                    print(f"   ✓ Best val accuracy so far: {best_val_acc:.2f}%")
                     break
                 except Exception as e:
                     print(f"   ⚠️ Resume failed: {e}")
@@ -709,7 +715,7 @@ def train_command(args):
                     vocab_path,
                     epoch,
                     global_step,
-                    best_val_loss,
+                    best_val_acc,
                     f"{args.output_dir}/checkpoint_step_{global_step}.safetensors",
                 )
                 save_checkpoint(
@@ -720,7 +726,7 @@ def train_command(args):
                     vocab_path,
                     epoch,
                     global_step,
-                    best_val_loss,
+                    best_val_acc,
                     f"{args.output_dir}/latest.safetensors",
                 )
 
@@ -778,7 +784,7 @@ def train_command(args):
             vocab_path,
             epoch + 1,
             global_step,
-            best_val_loss,
+            best_val_acc,
             f"{args.output_dir}/model_epoch_{epoch+1}.safetensors",
         )
         save_checkpoint(
@@ -789,13 +795,13 @@ def train_command(args):
             vocab_path,
             epoch + 1,
             global_step,
-            best_val_loss,
+            best_val_acc,
             f"{args.output_dir}/latest.safetensors",
         )
 
-        # Save best model
-        if val_loader and val_acc > best_val_loss:
-            best_val_loss = val_acc
+        # Save best model (higher accuracy is better)
+        if val_loader and val_acc > best_val_acc:
+            best_val_acc = val_acc
             save_checkpoint(
                 model,
                 optimizer,
@@ -804,7 +810,7 @@ def train_command(args):
                 vocab_path,
                 epoch + 1,
                 global_step,
-                best_val_loss,
+                best_val_acc,
                 f"{args.output_dir}/model.safetensors",
             )
             print(f"    ✓ New best model! Acc: {val_acc:.2f}%")
@@ -822,7 +828,7 @@ def train_command(args):
 
 
 def save_checkpoint(
-    model, optimizer, scheduler, cfg, vocab_path, epoch, step, best_val_loss, path
+    model, optimizer, scheduler, cfg, vocab_path, epoch, step, best_val_acc, path
 ):
     """Save checkpoint in safetensors format with metadata JSON"""
     if HAS_SAFETENSORS and path.endswith('.safetensors'):
@@ -835,7 +841,7 @@ def save_checkpoint(
             "vocab_path": str(vocab_path),
             "epoch": epoch,
             "step": step,
-            "best_val_loss": best_val_loss,
+            "best_val_acc": best_val_acc,
             "config": {
                 "IMG_H": cfg.IMG_H,
                 "IMG_W": cfg.IMG_W,
@@ -863,7 +869,7 @@ def save_checkpoint(
                 "vocab_path": vocab_path,
                 "epoch": epoch,
                 "step": step,
-                "best_val_loss": best_val_loss,
+                "best_val_acc": best_val_acc,
             },
             path,
         )
@@ -895,6 +901,12 @@ def load_checkpoint(path, device="cpu"):
         else:
             print(f"   ⚠️ Optimizer state file not found: {optim_path}")
         
+        # Handle both old "best_val_loss" and new "best_val_acc" keys
+        best_val = metadata.get("best_val_acc")
+        if best_val is None:
+            old_val = metadata.get("best_val_loss", 0)
+            best_val = 0 if old_val == float("inf") else old_val
+        
         result = {
             "model": model_state,
             "optimizer": optim_state.get("optimizer") if optim_state else None,
@@ -902,7 +914,7 @@ def load_checkpoint(path, device="cpu"):
             "vocab_path": metadata.get("vocab_path", ""),
             "epoch": metadata.get("epoch", 0),
             "step": metadata.get("step", 0),
-            "best_val_loss": metadata.get("best_val_loss", float("inf")),
+            "best_val_acc": best_val,
             "config": metadata.get("config", {}),
         }
         
