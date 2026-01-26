@@ -261,21 +261,52 @@ class TransformerDataset(Dataset):
             }
 
 
-def collate_fn(batch):
+# Maximum sequence length for decoder to prevent OOM
+MAX_DECODER_SEQ_LEN = 512  # Can be overridden via args
+
+
+def collate_fn(batch, max_seq_len=MAX_DECODER_SEQ_LEN):
     """Collate function that handles both CTC and decoder targets"""
     images = torch.stack([item["image"] for item in batch])
     texts = [item["text"] for item in batch]
 
-    # Decoder targets (padded)
+    # Decoder targets (padded and truncated to max_seq_len)
     dec_targets = [item["dec_target"] for item in batch]
-    max_dec_len = max(len(t) for t in dec_targets)
+    
+    # Truncate sequences that exceed max_seq_len
+    dec_targets_truncated = []
+    for t in dec_targets:
+        if len(t) > max_seq_len:
+            # Keep BOS at start and truncate, ensuring we don't exceed max_seq_len
+            dec_targets_truncated.append(t[:max_seq_len])
+        else:
+            dec_targets_truncated.append(t)
+    
+    max_dec_len = min(max(len(t) for t in dec_targets_truncated), max_seq_len)
     dec_padded = torch.zeros((len(batch), max_dec_len), dtype=torch.long)
-    for i, t in enumerate(dec_targets):
-        dec_padded[i, : len(t)] = t
+    for i, t in enumerate(dec_targets_truncated):
+        actual_len = min(len(t), max_dec_len)
+        dec_padded[i, :actual_len] = t[:actual_len]
 
-    # CTC targets (concatenated)
-    ctc_targets = torch.cat([item["ctc_target"] for item in batch])
-    ctc_target_lens = torch.LongTensor([item["ctc_target_len"] for item in batch])
+    # CTC targets (concatenated) - also truncate for consistency
+    ctc_targets_list = []
+    ctc_target_lens = []
+    for item in batch:
+        ctc_target = item["ctc_target"]
+        # Truncate CTC target to max_seq_len - 2 (accounting for BOS/EOS in decoder)
+        max_ctc_len = max_seq_len - 2
+        if len(ctc_target) > max_ctc_len:
+            ctc_target = ctc_target[:max_ctc_len]
+        ctc_targets_list.append(ctc_target)
+        ctc_target_lens.append(len(ctc_target))
+    
+    # Handle empty batch edge case
+    if all(len(t) == 0 for t in ctc_targets_list):
+        ctc_targets = torch.LongTensor([])
+    else:
+        ctc_targets = torch.cat([t for t in ctc_targets_list if len(t) > 0])
+    
+    ctc_target_lens = torch.LongTensor(ctc_target_lens)
 
     return {
         "images": images,
@@ -284,6 +315,13 @@ def collate_fn(batch):
         "ctc_target_lens": ctc_target_lens,
         "texts": texts,
     }
+
+
+def make_collate_fn(max_seq_len=MAX_DECODER_SEQ_LEN):
+    """Create a collate function with custom max_seq_len"""
+    def _collate(batch):
+        return collate_fn(batch, max_seq_len=max_seq_len)
+    return _collate
 
 
 # ========== TRAINING LOOP WITH CTC + DECODER LOSS ==========
@@ -432,11 +470,18 @@ def train_command(args):
         print("❌ No training samples found!")
         return
 
+    # Get max sequence length from args (default to MAX_DECODER_SEQ_LEN)
+    max_seq_len = getattr(args, "max_seq_len", MAX_DECODER_SEQ_LEN)
+    print(f"   Max sequence length: {max_seq_len}")
+    
+    # Create collate function with the specified max_seq_len
+    custom_collate = make_collate_fn(max_seq_len=max_seq_len)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=custom_collate,
         num_workers=4 if device == "cuda" else 0,
         pin_memory=(device == "cuda"),
     )
@@ -447,7 +492,7 @@ def train_command(args):
             val_ds,
             batch_size=args.batch_size,
             shuffle=False,
-            collate_fn=collate_fn,
+            collate_fn=custom_collate,
             num_workers=4 if device == "cuda" else 0,
         )
 

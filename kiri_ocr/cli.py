@@ -24,6 +24,7 @@ DEFAULT_TRAIN_CONFIG = {
     "save_steps": 1000,
     "resume": False,
     "from_model": None,
+    "max_seq_len": 512,  # Maximum decoder sequence length to prevent OOM
 }
 
 
@@ -318,6 +319,14 @@ def main():
     )
     train_parser.add_argument("--from-model", help="Initialize from pretrained model")
 
+    # Sequence length limit (to prevent OOM)
+    train_parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="Maximum decoder sequence length (default: 512). Longer sequences will be truncated.",
+    )
+
     # Device
     train_parser.add_argument("--device", choices=["cpu", "cuda"], default=None)
 
@@ -417,7 +426,8 @@ def main():
         print(f"⚖️  Loss weights: CTC={args.ctc_weight}, Decoder={args.dec_weight}")
         print(f"📊 Batch size: {args.batch_size}")
         print(f"🎯 Learning rate: {args.lr}")
-        print(f"💾 Save steps: {args.save_steps}")
+        print(f"📏 Max sequence length: {args.max_seq_len}")
+        print(f"� Save steps: {args.save_steps}")
 
         try:
             from .training import train_command

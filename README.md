@@ -131,6 +131,7 @@ kiri-ocr train \
     --weight-decay 0.01 \
     --ctc-weight 0.5 \
     --dec-weight 0.5 \
+    --max-seq-len 512 \
     --save-steps 5000 \
     --device cuda
 ```
@@ -139,16 +140,17 @@ kiri-ocr train \
 
 | Argument         | Default | Description                                         |
 | ---------------- | ------- | --------------------------------------------------- |
-| `--height`     | 48      | Image height                                        |
-| `--width`      | 640     | Image width                                         |
-| `--batch-size` | 32      | Training batch size                                 |
-| `--epochs`     | 100     | Number of training epochs                           |
-| `--lr`         | 0.0003  | Learning rate                                       |
-| `--ctc-weight` | 0.5     | Weight for CTC loss                                 |
-| `--dec-weight` | 0.5     | Weight for decoder loss                             |
-| `--vocab`      | Auto    | Path to vocab.json (auto-generated if not provided) |
-| `--save-steps` | 1000    | Save checkpoint every N steps                       |
-| `--resume`     | False   | Resume from latest checkpoint                       |
+| `--height`       | 48      | Image height                                        |
+| `--width`        | 640     | Image width                                         |
+| `--batch-size`   | 32      | Training batch size                                 |
+| `--epochs`       | 100     | Number of training epochs                           |
+| `--lr`           | 0.0003  | Learning rate                                       |
+| `--ctc-weight`   | 0.5     | Weight for CTC loss                                 |
+| `--dec-weight`   | 0.5     | Weight for decoder loss                             |
+| `--vocab`        | Auto    | Path to vocab.json (auto-generated if not provided) |
+| `--save-steps`   | 1000    | Save checkpoint every N steps                       |
+| `--max-seq-len`  | 512     | Maximum decoder sequence length (prevents OOM)      |
+| `--resume`       | False   | Resume from latest checkpoint                       |
 
 ### Resume Training
 
@@ -363,6 +365,9 @@ weight_decay: 0.01
 ctc_weight: 0.5
 dec_weight: 0.5
 
+# Sequence length limit (prevents OOM with long texts)
+max_seq_len: 512
+
 # Paths
 output_dir: output
 save_steps: 5000
@@ -446,11 +451,24 @@ ls output/
 
 ### CUDA out of memory
 
-**Fix:** Reduce batch size
+**Cause 1:** Batch size too large for GPU memory
 
 ```bash
+# Fix: Reduce batch size
 kiri-ocr train --batch-size 16 ...
 ```
+
+**Cause 2:** Dataset contains very long text sequences (100k+ characters)
+
+```bash
+# Fix: Limit maximum sequence length (default: 512)
+kiri-ocr train --max-seq-len 256 ...
+
+# For more VRAM, you can increase it
+kiri-ocr train --max-seq-len 1024 ...
+```
+
+The `--max-seq-len` parameter truncates sequences that exceed the limit, preventing the decoder's causal attention mask from consuming excessive memory.
 
 ### Low confidence scores
 
