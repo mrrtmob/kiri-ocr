@@ -1,4 +1,3 @@
-# kiri_ocr/training.py
 """
 KiriOCR Transformer Training Module.
 
@@ -17,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import json
 import math
+import itertools
 
 try:
     from datasets import load_dataset
@@ -482,7 +482,7 @@ def train_command(args):
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=custom_collate,
-        num_workers=4 if device == "cuda" else 0,
+        num_workers=1 if device == "cuda" else 0,
         pin_memory=(device == "cuda"),
     )
 
@@ -597,6 +597,16 @@ def train_command(args):
     print("=" * 60)
 
     history = {"train_loss": [], "val_loss": [], "ctc_loss": [], "dec_loss": []}
+
+    # Info about resume state
+    steps_per_epoch = len(train_loader)
+    if global_step > 0:
+        completed_in_epoch = global_step - (start_epoch * steps_per_epoch)
+        print(f"\n📊 Resume info:")
+        print(f"   Total steps completed: {global_step}")
+        print(f"   Steps per epoch: {steps_per_epoch}")
+        print(f"   Starting from epoch {start_epoch + 1} (will restart from beginning)")
+        print(f"   Note: With shuffle=True, epoch restarts from batch 0 but LR continues correctly")
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
