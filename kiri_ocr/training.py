@@ -547,23 +547,49 @@ def train_command(args):
                 print(f"\n🔄 Resuming from {resume_path}...")
                 try:
                     ckpt = load_checkpoint(resume_path, device)
-                    model.load_state_dict(ckpt["model"], strict=False)
+                    
+                    # Load model weights
+                    if ckpt.get("model") is not None:
+                        model.load_state_dict(ckpt["model"], strict=False)
+                        print(f"   ✓ Loaded model weights")
+                    else:
+                        print(f"   ⚠️ No model weights in checkpoint")
 
-                    if "optimizer" in ckpt:
-                        optimizer.load_state_dict(ckpt["optimizer"])
-                    if "scheduler" in ckpt:
-                        scheduler.load_state_dict(ckpt["scheduler"])
-                    if "epoch" in ckpt:
+                    # Load optimizer state
+                    if ckpt.get("optimizer") is not None:
+                        try:
+                            optimizer.load_state_dict(ckpt["optimizer"])
+                            print(f"   ✓ Loaded optimizer state")
+                        except Exception as e:
+                            print(f"   ⚠️ Could not load optimizer: {e}")
+                    else:
+                        print(f"   ⚠️ No optimizer state in checkpoint")
+                    
+                    # Load scheduler state
+                    if ckpt.get("scheduler") is not None:
+                        try:
+                            scheduler.load_state_dict(ckpt["scheduler"])
+                            print(f"   ✓ Loaded scheduler state")
+                        except Exception as e:
+                            print(f"   ⚠️ Could not load scheduler: {e}")
+                    else:
+                        print(f"   ⚠️ No scheduler state in checkpoint")
+                    
+                    # Load training progress
+                    if ckpt.get("epoch") is not None:
                         start_epoch = ckpt["epoch"]
-                    if "step" in ckpt:
+                    if ckpt.get("step") is not None:
                         global_step = ckpt["step"]
-                    if "best_val_loss" in ckpt:
+                    if ckpt.get("best_val_loss") is not None:
                         best_val_loss = ckpt["best_val_loss"]
 
-                    print(f"   ✓ Resumed at epoch {start_epoch}, step {global_step}")
+                    print(f"   ✓ Resuming from epoch {start_epoch}, step {global_step}")
+                    print(f"   ✓ Best val metric so far: {best_val_loss}")
                     break
                 except Exception as e:
                     print(f"   ⚠️ Resume failed: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     # ========== 8. TRAINING LOOP ==========
     print(f"\n" + "=" * 60)
@@ -831,31 +857,44 @@ def load_checkpoint(path, device="cpu"):
     """Load checkpoint from safetensors or pt format"""
     if path.endswith('.safetensors') and HAS_SAFETENSORS:
         # Load model weights
-        model_state = load_file(path, device=device)
+        print(f"   Loading safetensors checkpoint: {path}")
+        model_state = load_file(path, device=str(device))
         
         # Load metadata
         metadata_path = path.replace('.safetensors', '_meta.json')
         metadata = {}
         if os.path.exists(metadata_path):
+            print(f"   Loading metadata: {metadata_path}")
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
+        else:
+            print(f"   ⚠️ Metadata file not found: {metadata_path}")
         
         # Load optimizer state
         optim_path = path.replace('.safetensors', '_optim.pt')
         optim_state = {}
         if os.path.exists(optim_path):
+            print(f"   Loading optimizer state: {optim_path}")
             optim_state = torch.load(optim_path, map_location=device, weights_only=False)
+        else:
+            print(f"   ⚠️ Optimizer state file not found: {optim_path}")
         
-        return {
+        result = {
             "model": model_state,
-            "optimizer": optim_state.get("optimizer"),
-            "scheduler": optim_state.get("scheduler"),
+            "optimizer": optim_state.get("optimizer") if optim_state else None,
+            "scheduler": optim_state.get("scheduler") if optim_state else None,
             "vocab_path": metadata.get("vocab_path", ""),
             "epoch": metadata.get("epoch", 0),
             "step": metadata.get("step", 0),
             "best_val_loss": metadata.get("best_val_loss", float("inf")),
             "config": metadata.get("config", {}),
         }
+        
+        print(f"   Checkpoint info: epoch={result['epoch']}, step={result['step']}")
+        return result
     else:
         # Load torch checkpoint
-        return torch.load(path, map_location=device, weights_only=False)
+        print(f"   Loading torch checkpoint: {path}")
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        print(f"   Checkpoint keys: {list(ckpt.keys()) if isinstance(ckpt, dict) else 'state_dict only'}")
+        return ckpt
