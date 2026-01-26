@@ -417,8 +417,14 @@ def train_command(args):
     ):
         print(f"   🔄 Loading weights from {args.from_model}")
         try:
-            ckpt = torch.load(args.from_model, map_location="cpu", weights_only=False)
-            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            from_model_path = args.from_model
+            # Check if it's a safetensors file
+            if from_model_path.endswith('.safetensors') and HAS_SAFETENSORS:
+                state_dict = load_file(from_model_path, device="cpu")
+            else:
+                # Load as torch checkpoint
+                ckpt = torch.load(from_model_path, map_location="cpu", weights_only=False)
+                state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
             model.load_state_dict(state_dict, strict=False)
             print("   ✓ Weights loaded")
         except Exception as e:
