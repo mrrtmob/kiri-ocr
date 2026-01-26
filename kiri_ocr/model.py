@@ -52,19 +52,19 @@ class CFG:
     USE_AUTOCAST: bool = True
 
     # --- Inference Params ---
-    CTC_FUSION_ALPHA: float = 0.5
+    CTC_FUSION_ALPHA: float = 0.35
     BEAM: int = 4
-    BEAM_LENP: float = 0.6  # FIXED: was 0.0
+    BEAM_LENP: float = 0.75  # FIXED: was 0.0
 
-    EOS_LOGP_BIAS: float = 5.0
-    EOS_LOGP_BOOST: float = 5.0
-    EOS_BIAS_UNTIL_LEN: int = 3
+    EOS_LOGP_BIAS: float = 0.55
+    EOS_LOGP_BOOST: float = 0.65
+    EOS_BIAS_UNTIL_LEN: int = 28
 
-    REPEAT_LAST_PENALTY: float = 3.0
-    UNK_LOGP_PENALTY: float = 2.0
+    REPEAT_LAST_PENALTY: float = 1.0
+    UNK_LOGP_PENALTY: float = 1.0
 
-    DEC_MAX_LEN_RATIO: float = 1.5
-    DEC_MAX_LEN_PAD: int = 10
+    DEC_MAX_LEN_RATIO: float = 1.35
+    DEC_MAX_LEN_PAD: int = 6
     MEM_MAX_LEN_RATIO: float = 0.75
 
 
