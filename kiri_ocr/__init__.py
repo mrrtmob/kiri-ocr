@@ -11,7 +11,7 @@ from .renderer import DocumentRenderer
 from .model import KiriOCR, CFG, CharTokenizer
 from .detector import TextDetector
 
-__version__ = '0.2.2'
+__version__ = '0.2.3'
 
 __all__ = [
     'OCR',
