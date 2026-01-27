@@ -51,9 +51,16 @@ class TextDetector:
              possible_paths = []
              if self.method == 'db':
                  possible_paths = [
+                     # Local project paths
+                     'models/detector.onnx',
+                     'detector.onnx',
+                     # Legacy model names
                      'DB_TD500_resnet50.onnx',
-                     os.path.join(os.path.dirname(__file__), 'DB_TD500_resnet50.onnx'),
                      'DB_IC15_resnet18.onnx',
+                     # Package directory
+                     os.path.join(os.path.dirname(__file__), 'detector.onnx'),
+                     os.path.join(os.path.dirname(__file__), 'db', 'detector.onnx'),
+                     os.path.join(os.path.dirname(__file__), '..', 'models', 'detector.onnx'),
                  ]
              else: # CRAFT
                  possible_paths = [
@@ -75,18 +82,29 @@ class TextDetector:
         if model_path and "/" in model_path and not os.path.exists(model_path) and not model_path.startswith((".", "/")):
              try:
                  from huggingface_hub import hf_hub_download
+                 hf_path = None
                  # Check for detector model in specific subfolder
                  # Prefer detector/DB/detector.onnx as requested
                  try:
-                     model_path = hf_hub_download(repo_id=model_path, filename="detector/DB/detector.onnx")
-                 except:
+                     hf_path = hf_hub_download(repo_id=model_path, filename="detector/DB/detector.onnx")
+                 except Exception:
                      try:
                          # Fallback to detector/detector.onnx
-                         model_path = hf_hub_download(repo_id=model_path, filename="detector/detector.onnx")
-                     except:
+                         hf_path = hf_hub_download(repo_id=model_path, filename="detector/detector.onnx")
+                     except Exception:
                          pass
+                 
+                 if hf_path and os.path.exists(hf_path):
+                     model_path = hf_path
+                 else:
+                     print(f"Warning: Could not find detector model in HuggingFace repo: {model_path}")
+                     model_path = None
+             except ImportError:
+                 print("Warning: huggingface_hub not installed. Install with: pip install huggingface_hub")
+                 model_path = None
              except Exception as e:
                  print(f"Warning: Could not download detector from HuggingFace: {e}")
+                 model_path = None
         
         self.model_path = model_path
         
