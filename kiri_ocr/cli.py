@@ -100,6 +100,11 @@ def run_inference(args):
             verbose=args.verbose,
         )
 
+        # Streaming mode - character by character like LLM
+        if args.stream:
+            run_streaming_inference(ocr, args, output_dir)
+            return
+
         if not args.verbose:
             print(f"Processing {args.image}...")
 
@@ -154,6 +159,68 @@ def run_inference(args):
             import traceback
 
             traceback.print_exc()
+
+
+def run_streaming_inference(ocr, args, output_dir):
+    """Run OCR with LLM-style character-by-character streaming output."""
+    import sys
+    
+    all_text = []
+    results = []
+    current_region_text = ""
+    
+    try:
+        for chunk in ocr.extract_text_stream_chars(args.image, mode=args.mode):
+            if chunk.get("region_start"):
+                # New region starting
+                if current_region_text:
+                    all_text.append(current_region_text)
+                current_region_text = ""
+                
+                if args.verbose:
+                    region_num = chunk["region_number"]
+                    total = chunk["total_regions"]
+                    print(f"\n[{region_num}/{total}] ", end="", flush=True)
+            else:
+                # Print character as it's generated
+                token = chunk.get("token", "")
+                if token:
+                    print(token, end="", flush=True)
+                    current_region_text += token
+                
+                # Collect result when region finishes
+                if chunk.get("region_finished"):
+                    results.append({
+                        "box": chunk.get("box", []),
+                        "text": chunk.get("text", ""),
+                        "confidence": chunk.get("confidence", 0.0),
+                        "det_confidence": chunk.get("det_confidence", 1.0),
+                        "line_number": chunk.get("region_number", 0),
+                    })
+        
+        # Add last region
+        if current_region_text:
+            all_text.append(current_region_text)
+        
+        print()  # Final newline
+        
+        # Save results
+        full_text = "\n".join(all_text)
+        
+        text_output = output_dir / "extracted_text.txt"
+        with open(text_output, "w", encoding="utf-8") as f:
+            f.write(full_text)
+        
+        json_output = output_dir / "ocr_results.json"
+        with open(json_output, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        
+        if args.verbose:
+            print(f"\n✓ Saved to {output_dir}")
+            
+    except KeyboardInterrupt:
+        print("\n\n⏹️ Interrupted")
+        sys.exit(1)
 
 
 def merge_config(args, defaults):
@@ -249,6 +316,10 @@ def main():
     predict_parser.add_argument("--no-render", action="store_true")
     predict_parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     predict_parser.add_argument("--verbose", "-v", action="store_true")
+    predict_parser.add_argument(
+        "--stream", "-s", action="store_true",
+        help="Stream text character-by-character like LLM generation"
+    )
 
     # ========== TRAIN ==========
     train_parser = subparsers.add_parser("train", help="🎓 Train the OCR model")

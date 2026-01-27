@@ -6,12 +6,34 @@ Main Components:
 - KiriOCR: Transformer-based OCR model (CNN + Transformer encoder + CTC/Attention decoder)
 - TextDetector: Text detection module
 """
-from .core import OCR
-from .renderer import DocumentRenderer
-from .model import KiriOCR, CFG, CharTokenizer
-from .detector import TextDetector
 
 __version__ = '0.2.4'
+
+# Lazy imports for fast CLI startup
+# Heavy modules (torch, cv2) are only loaded when actually used
+
+def __getattr__(name):
+    """Lazy import heavy modules only when accessed."""
+    if name == 'OCR':
+        from .core import OCR
+        return OCR
+    elif name == 'DocumentRenderer':
+        from .renderer import DocumentRenderer
+        return DocumentRenderer
+    elif name == 'KiriOCR':
+        from .model import KiriOCR
+        return KiriOCR
+    elif name == 'CFG':
+        from .model import CFG
+        return CFG
+    elif name == 'CharTokenizer':
+        from .model import CharTokenizer
+        return CharTokenizer
+    elif name == 'TextDetector':
+        from .detector import TextDetector
+        return TextDetector
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     'OCR',

@@ -7,7 +7,7 @@ and recognition into a unified document processing pipeline.
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -26,6 +26,8 @@ from .model import (
     KiriOCR,
     beam_decode_one_batched,
     greedy_ctc_decode,
+    greedy_decode_streaming,
+    beam_decode_streaming,
     preprocess_pil,
 )
 
@@ -382,6 +384,97 @@ class OCR:
 
         return text, confidence
 
+    def recognize_region_streaming(
+        self,
+        image_tensor: torch.Tensor,
+        use_beam_search: bool = False,
+    ) -> Generator[Dict, None, None]:
+        """
+        Recognize text with character-by-character streaming, like LLM generation.
+        
+        Yields each character/token as it's decoded by the model.
+        
+        Args:
+            image_tensor: Preprocessed image tensor from preprocess_pil()
+            use_beam_search: Use beam search (slower but higher quality)
+            
+        Yields:
+            Dict with:
+            - 'token': The new character/token string
+            - 'text': Full decoded text so far
+            - 'confidence': Token/sequence confidence
+            - 'step': Current decoding step
+            - 'finished': Whether decoding is complete
+            
+        Example:
+            >>> tensor = ocr._preprocess_region(img, box)
+            >>> for result in ocr.recognize_region_streaming(tensor):
+            ...     print(result['token'], end='', flush=True)
+            ...     if result['finished']:
+            ...         print()
+        """
+        image_tensor = image_tensor.to(self.device)
+
+        if self.cfg.USE_FP16 and self.device == "cuda":
+            image_tensor = image_tensor.half()
+
+        # Encode image
+        mem = self.model.encode(image_tensor)
+        mem_proj = self.model.mem_proj(mem)
+
+        # Get CTC logits for length estimation
+        ctc_logits = None
+        if self.cfg.USE_CTC and hasattr(self.model, "ctc_head"):
+            ctc_logits = self.model.ctc_head(mem)
+
+        # Stream decode
+        if use_beam_search:
+            yield from beam_decode_streaming(
+                self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
+            )
+        else:
+            yield from greedy_decode_streaming(
+                self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
+            )
+
+    def recognize_streaming(
+        self,
+        image_path: Union[str, Path],
+        use_beam_search: bool = False,
+    ) -> Generator[Dict, None, None]:
+        """
+        Recognize text from a single-line image with character streaming.
+        
+        Like LLM text generation - yields each character as decoded.
+        
+        Args:
+            image_path: Path to the single-line text image
+            use_beam_search: Use beam search for better quality
+            
+        Yields:
+            Dict with token, text, confidence, step, finished
+            
+        Example:
+            >>> for chunk in ocr.recognize_streaming('line.png'):
+            ...     print(chunk['token'], end='', flush=True)
+        """
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+
+        # Convert to grayscale
+        if len(img.shape) == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Invert if dark background
+        if np.mean(img) < 127:
+            img = 255 - img
+
+        img_pil = Image.fromarray(img)
+        img_tensor = preprocess_pil(self.cfg, img_pil)
+
+        yield from self.recognize_region_streaming(img_tensor, use_beam_search)
+
     def recognize_single_line_image(
         self, 
         image_path: Union[str, Path]
@@ -489,6 +582,314 @@ class OCR:
                     print(f"  {i:2d}. [Error: {e}]")
 
         return results
+
+    def process_document_streaming(
+        self,
+        image_path: Union[str, Path],
+        mode: str = "lines",
+        verbose: bool = False,
+    ) -> Generator[Dict, None, None]:
+        """
+        Process a document image with streaming/real-time inference.
+        
+        Yields each text region result as soon as it's recognized,
+        without waiting for all regions to be processed.
+
+        Args:
+            image_path: Path to the document image
+            mode: Detection mode - 'lines' or 'words'
+            verbose: Enable verbose output
+
+        Yields:
+            Dict for each recognized region with keys:
+            - 'box': [x, y, w, h] bounding box
+            - 'text': Recognized text string
+            - 'confidence': Recognition confidence (0-1)
+            - 'det_confidence': Detection confidence (0-1)
+            - 'line_number': Sequential line number
+            - 'total_regions': Total number of detected regions
+        """
+        if verbose:
+            print(f"\n📄 Processing (streaming): {image_path}")
+            print(f"🔲 Box padding: {self.padding}px")
+
+        # Detect text regions
+        if mode == "lines":
+            if hasattr(self.detector, "detect_lines_objects"):
+                text_boxes = self.detector.detect_lines_objects(image_path)
+                boxes = [b.bbox for b in text_boxes]
+                det_confs = [b.confidence for b in text_boxes]
+            else:
+                boxes = self.detector.detect_lines(image_path)
+                det_confs = [1.0] * len(boxes)
+        else:
+            boxes = self.detector.detect_words(image_path)
+            det_confs = [1.0] * len(boxes)
+
+        total_regions = len(boxes)
+        
+        if verbose:
+            print(f"🔍 Detected {total_regions} regions")
+
+        # Load and prepare image
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+            
+        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+
+        # Recognize and yield each region immediately
+        for i, (box, det_conf) in enumerate(zip(boxes, det_confs), 1):
+            try:
+                region_tensor = self._preprocess_region(img_gray, box, extra_padding=5)
+                if region_tensor is None:
+                    continue
+
+                text, confidence = self.recognize_region(region_tensor)
+
+                result = {
+                    "box": [int(v) for v in box],
+                    "text": text,
+                    "confidence": float(confidence),
+                    "det_confidence": float(det_conf),
+                    "line_number": i,
+                    "total_regions": total_regions,
+                }
+
+                if verbose:
+                    print(f"  {i:2d}. {text[:50]:50s} ({confidence*100:.1f}%)")
+
+                yield result
+
+            except Exception as e:
+                if verbose:
+                    print(f"  {i:2d}. [Error: {e}]")
+                # Yield error result so caller knows about failures
+                yield {
+                    "box": [int(v) for v in box],
+                    "text": "",
+                    "confidence": 0.0,
+                    "det_confidence": float(det_conf),
+                    "line_number": i,
+                    "total_regions": total_regions,
+                    "error": str(e),
+                }
+
+    def extract_text_stream_chars(
+        self,
+        image_path: Union[str, Path],
+        mode: str = "lines",
+        use_beam_search: bool = False,
+        verbose: bool = False,
+    ) -> Generator[Dict, None, None]:
+        """
+        Extract text with LLM-style character-by-character streaming.
+        
+        For each detected text region, yields each character as it's decoded,
+        just like LLM text generation. Perfect for real-time display.
+        
+        Args:
+            image_path: Path to the document image
+            mode: Detection mode - 'lines' or 'words'
+            use_beam_search: Use beam search for better quality (slower)
+            verbose: Enable verbose output
+
+        Yields:
+            Dict with:
+            - 'token': New character/token (empty string at region boundaries)
+            - 'text': Full text of current region so far
+            - 'cumulative_text': All text from all regions so far
+            - 'region_number': Current region being processed
+            - 'total_regions': Total detected regions
+            - 'step': Decoding step within current region
+            - 'region_finished': Whether current region is done
+            - 'document_finished': Whether all regions are done
+            - 'region_start': True if this is the start of a new region
+            - 'box': Bounding box of current region
+            
+        Example:
+            >>> for chunk in ocr.extract_text_stream_chars('document.png'):
+            ...     if chunk['region_start']:
+            ...         print(f"\\nRegion {chunk['region_number']}: ", end='')
+            ...     print(chunk['token'], end='', flush=True)
+        """
+        if verbose:
+            print(f"\n📄 Processing (char streaming): {image_path}")
+        
+        # Detect text regions
+        if mode == "lines":
+            if hasattr(self.detector, "detect_lines_objects"):
+                text_boxes = self.detector.detect_lines_objects(image_path)
+                boxes = [b.bbox for b in text_boxes]
+                det_confs = [b.confidence for b in text_boxes]
+            else:
+                boxes = self.detector.detect_lines(image_path)
+                det_confs = [1.0] * len(boxes)
+        else:
+            boxes = self.detector.detect_words(image_path)
+            det_confs = [1.0] * len(boxes)
+        
+        total_regions = len(boxes)
+        
+        if verbose:
+            print(f"🔍 Detected {total_regions} regions")
+        
+        # Load image
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        
+        all_region_texts = []
+        
+        for region_num, (box, det_conf) in enumerate(zip(boxes, det_confs), 1):
+            try:
+                region_tensor = self._preprocess_region(img_gray, box, extra_padding=5)
+                if region_tensor is None:
+                    continue
+                
+                # Yield region start marker
+                yield {
+                    "token": "",
+                    "text": "",
+                    "cumulative_text": "\n".join(all_region_texts),
+                    "region_number": region_num,
+                    "total_regions": total_regions,
+                    "step": 0,
+                    "region_finished": False,
+                    "document_finished": False,
+                    "region_start": True,
+                    "box": [int(v) for v in box],
+                    "det_confidence": float(det_conf),
+                }
+                
+                current_region_text = ""
+                
+                # Stream characters for this region
+                for chunk in self.recognize_region_streaming(region_tensor, use_beam_search):
+                    current_region_text = chunk["text"]
+                    
+                    # Build cumulative text
+                    temp_texts = all_region_texts + ([current_region_text] if current_region_text else [])
+                    cumulative = "\n".join(temp_texts)
+                    
+                    yield {
+                        "token": chunk["token"],
+                        "text": current_region_text,
+                        "cumulative_text": cumulative,
+                        "region_number": region_num,
+                        "total_regions": total_regions,
+                        "step": chunk["step"],
+                        "confidence": chunk["confidence"],
+                        "region_finished": chunk["finished"],
+                        "document_finished": chunk["finished"] and region_num == total_regions,
+                        "region_start": False,
+                        "box": [int(v) for v in box],
+                        "det_confidence": float(det_conf),
+                    }
+                    
+                    if chunk["finished"]:
+                        break
+                
+                if current_region_text:
+                    all_region_texts.append(current_region_text)
+                    
+                if verbose:
+                    print(f"  {region_num:2d}. {current_region_text[:50]}")
+                    
+            except Exception as e:
+                if verbose:
+                    print(f"  {region_num:2d}. [Error: {e}]")
+                yield {
+                    "token": "",
+                    "text": "",
+                    "cumulative_text": "\n".join(all_region_texts),
+                    "region_number": region_num,
+                    "total_regions": total_regions,
+                    "step": 0,
+                    "region_finished": True,
+                    "document_finished": region_num == total_regions,
+                    "region_start": True,
+                    "box": [int(v) for v in box],
+                    "error": str(e),
+                }
+
+    def extract_text_streaming(
+        self,
+        image_path: Union[str, Path],
+        mode: str = "lines",
+        verbose: bool = False,
+    ) -> Generator[Dict, None, None]:
+        """
+        Extract text with real-time streaming - yields each region as it's recognized.
+        
+        This is useful for:
+        - Real-time UI updates showing progress
+        - Processing results before full document is complete
+        - Displaying text character by character as recognized
+        
+        Args:
+            image_path: Path to the document image
+            mode: Detection mode - 'lines' or 'words'
+            verbose: Enable verbose output
+
+        Yields:
+            Dict for each region containing:
+            - 'box': [x, y, w, h] bounding box
+            - 'text': Recognized text string
+            - 'confidence': Recognition confidence (0-1)
+            - 'det_confidence': Detection confidence (0-1)
+            - 'line_number': Current region number
+            - 'total_regions': Total number of detected regions
+            - 'cumulative_text': All text recognized so far (lines joined)
+            
+        Example:
+            >>> ocr = OCR()
+            >>> for result in ocr.extract_text_streaming('document.png'):
+            ...     print(f"Region {result['line_number']}/{result['total_regions']}")
+            ...     print(f"Text: {result['text']}")
+            ...     print(f"Progress: {result['cumulative_text']}")
+        """
+        all_results = []
+        lines = []
+        current_line = []
+        prev_center_y = None
+        prev_height = None
+        
+        for result in self.process_document_streaming(image_path, mode, verbose):
+            all_results.append(result)
+            
+            if "error" not in result and result["text"]:
+                # Group into lines based on vertical position
+                y, h = result["box"][1], result["box"][3]
+                center_y = y + h / 2
+
+                if prev_center_y is not None:
+                    tolerance = max(h, prev_height) * 0.8
+                    
+                    if abs(center_y - prev_center_y) < tolerance:
+                        current_line.append(result["text"])
+                    else:
+                        if current_line:
+                            lines.append(" ".join(current_line))
+                        current_line = [result["text"]]
+                else:
+                    current_line = [result["text"]]
+
+                prev_center_y = center_y
+                prev_height = h
+            
+            # Build cumulative text including current line
+            temp_lines = lines.copy()
+            if current_line:
+                temp_lines.append(" ".join(current_line))
+            cumulative_text = "\n".join(temp_lines)
+            
+            # Add cumulative text to result
+            result["cumulative_text"] = cumulative_text
+            
+            yield result
 
     def extract_text(
         self,
