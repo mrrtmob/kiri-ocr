@@ -110,7 +110,7 @@ Kiri OCR uses a Transformer architecture with:
 
 ```bash
 kiri-ocr train \
-    --hf-dataset mrrtmob/km_en_image_line \
+    --hf-dataset mrrtmob/khmer_english_ocr_image_line \
     --output-dir output \
     --epochs 100 \
     --batch-size 32 \
@@ -121,7 +121,7 @@ kiri-ocr train \
 
 ```bash
 kiri-ocr train \
-    --hf-dataset mrrtmob/km_en_image_line \
+    --hf-dataset mrrtmob/khmer_english_ocr_image_line \
     --output-dir output \
     --height 48 \
     --width 640 \
@@ -158,7 +158,7 @@ If training is interrupted:
 
 ```bash
 kiri-ocr train \
-    --hf-dataset mrrtmob/km_en_image_line \
+    --hf-dataset mrrtmob/khmer_english_ocr_image_line \
     --output-dir output \
     --epochs 100 \
     --resume \
@@ -180,7 +180,7 @@ drive.mount('/content/drive')
 
 # Cell 2: Train
 !kiri-ocr train \
-    --hf-dataset mrrtmob/km_en_image_line \
+    --hf-dataset mrrtmob/khmer_english_ocr_image_line \
     --output-dir /content/drive/MyDrive/kiri_models/v1 \
     --height 48 \
     --width 640 \
@@ -376,7 +376,7 @@ save_steps: 5000
 device: cuda
 
 # Dataset (HuggingFace)
-hf_dataset: mrrtmob/km_en_image_line
+hf_dataset: mrrtmob/khmer_english_ocr_image_line
 hf_train_split: train
 hf_image_col: image
 hf_text_col: text

@@ -9,3 +9,8 @@ matplotlib>=3.7.0
 datasets>=2.14.0
 huggingface_hub>=0.16.0
 safetensors>=0.4.0
+
+# DB text detector dependencies (optional but recommended)
+onnxruntime>=1.15.0
+pyclipper>=1.3.0
+shapely>=2.0.0

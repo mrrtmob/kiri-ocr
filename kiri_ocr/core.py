@@ -1,14 +1,18 @@
-# kiri_ocr/core.py
 """
 Core OCR class for Kiri OCR using Transformer architecture.
+
+This module provides the main OCR class that combines text detection
+and recognition into a unified document processing pipeline.
 """
-import torch
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
 import cv2
 import numpy as np
-import sys
+import torch
 from PIL import Image
-from pathlib import Path
-import json
 
 try:
     from safetensors.torch import load_file
@@ -17,9 +21,9 @@ except ImportError:
     HAS_SAFETENSORS = False
 
 from .model import (
-    KiriOCR,
     CFG,
     CharTokenizer,
+    KiriOCR,
     beam_decode_one_batched,
     greedy_ctc_decode,
     preprocess_pil,
@@ -27,34 +31,48 @@ from .model import (
 
 
 class OCR:
-    """Complete Document OCR System with Transformer Model"""
+    """
+    Complete Document OCR System with Transformer Model.
+    
+    Combines text detection and recognition for full document OCR.
+    Supports multiple detection backends (DB, CRAFT, legacy CV).
+    
+    Example:
+        >>> ocr = OCR(model_path='mrrtmob/kiri-ocr')
+        >>> text, results = ocr.extract_text('document.png')
+        >>> print(text)
+    """
 
-    _model_cache = {}
+    # Class-level model cache for memory efficiency
+    _model_cache: Dict[Tuple[str, str], Dict] = {}
 
     def __init__(
         self,
-        model_path="mrrtmob/kiri-ocr",
-        det_model_path=None,
-        det_method="db",
-        det_conf_threshold=0.5,
-        padding=10,
-        device="cpu",
-        verbose=False,
-        use_beam_search=True,
-        use_fp16=None,
+        model_path: str = "mrrtmob/kiri-ocr",
+        det_model_path: Optional[str] = None,
+        det_method: str = "db",
+        det_conf_threshold: float = 0.5,
+        padding: int = 10,
+        device: str = "cpu",
+        verbose: bool = False,
+        use_beam_search: bool = True,
+        use_fp16: Optional[bool] = None,
     ):
         """
+        Initialize the OCR system.
+
         Args:
-            model_path: Path to trained model (.safetensors or .pt) or HuggingFace repo
-            det_model_path: Path to detector model (optional)
-            det_method: Detection method ('db', 'craft', 'yolo')
-            det_conf_threshold: Confidence threshold for detector
-            padding: Pixels to pad around detected boxes
-            device: 'cpu' or 'cuda'
-            verbose: Print loading info
-            use_beam_search: Use beam search (True) or greedy CTC (False)
-            use_fp16: Force FP16 usage (True/False/None)
+            model_path: Path to recognition model (.safetensors/.pt) or HuggingFace repo ID
+            det_model_path: Path to detection model (ONNX for DB, PTH for CRAFT)
+            det_method: Detection method - 'db', 'craft', or 'legacy'
+            det_conf_threshold: Confidence threshold for text detection
+            padding: Pixels to pad around detected text regions
+            device: Compute device - 'cpu' or 'cuda'
+            verbose: Enable verbose output during processing
+            use_beam_search: Use beam search decoding (slower but more accurate)
+            use_fp16: Force FP16 inference (None=auto, True/False=forced)
         """
+        # Store configuration
         self.device = device
         self.verbose = verbose
         self.padding = padding
@@ -64,85 +82,92 @@ class OCR:
         self.use_beam_search = use_beam_search
         self.use_fp16 = use_fp16
 
-        # Transformer model components
-        self.cfg = None
-        self.tokenizer = None
-        self.model = None
+        # Model components (initialized in _load_model)
+        self.cfg: Optional[CFG] = None
+        self.tokenizer: Optional[CharTokenizer] = None
+        self.model: Optional[KiriOCR] = None
 
         # Store repo_id for detector lazy loading
-        self.repo_id = None
+        self.repo_id: Optional[str] = None
         if "/" in model_path and not model_path.startswith((".", "/")):
             self.repo_id = model_path
 
-        # Resolve model path (HuggingFace, local, etc.)
-        model_path = self._resolve_model_path(model_path)
-
-        # Load model
-        self._load_model(model_path)
+        # Resolve and load model
+        resolved_path = self._resolve_model_path(model_path)
+        self._load_model(resolved_path)
 
         # Lazy-loaded detector
         self._detector = None
 
-    def _resolve_model_path(self, model_path):
-        """Resolve model path from various sources"""
+    # ==================== Model Loading ====================
+
+    def _resolve_model_path(self, model_path: str) -> str:
+        """
+        Resolve model path from various sources.
+        
+        Checks in order:
+        1. Direct path (if exists)
+        2. Package directory
+        3. HuggingFace Hub
+        """
         model_file = Path(model_path)
 
+        # Direct path
         if model_file.exists():
             return str(model_file)
 
-        # Try package directory
+        # Package directory fallback
         pkg_dir = Path(__file__).parent
         candidates = [
             pkg_dir / model_path,
             pkg_dir.parent / "models" / model_file.name,
         ]
-
         for candidate in candidates:
             if candidate.exists():
                 return str(candidate)
 
-        # Try HuggingFace
+        # HuggingFace Hub
         if "/" in model_path and not model_path.startswith((".", "/")):
-            try:
-                from huggingface_hub import hf_hub_download
-
-                if self.verbose:
-                    print(f"⬇️ Downloading from HuggingFace: {model_path}")
-
-                # Try config.json for download stats
-                try:
-                    hf_hub_download(repo_id=model_path, filename="config.json")
-                except:
-                    pass
-
-                # Try downloading vocab.json or vocab_auto.json
-                for vocab_name in ["vocab.json", "vocab_auto.json"]:
-                    try:
-                        hf_hub_download(repo_id=model_path, filename=vocab_name)
-                        break
-                    except:
-                        pass
-
-                # Try downloading model (safetensors first, then pt)
-                for model_name in ["model.safetensors", "model.pt"]:
-                    try:
-                        return hf_hub_download(repo_id=model_path, filename=model_name)
-                    except:
-                        pass
-
-            except Exception as e:
-                if self.verbose:
-                    print(f"⚠️ HuggingFace download failed: {e}")
+            return self._download_from_huggingface(model_path)
 
         return model_path  # Return as-is, let load fail with clear error
 
-    def _load_model(self, model_path):
-        """Load Transformer model from checkpoint (safetensors or pt)"""
+    def _download_from_huggingface(self, repo_id: str) -> str:
+        """Download model from HuggingFace Hub."""
+        try:
+            from huggingface_hub import hf_hub_download
+
+            if self.verbose:
+                print(f"⬇️ Downloading from HuggingFace: {repo_id}")
+
+            # Download auxiliary files (optional)
+            for filename in ["config.json", "vocab.json", "vocab_auto.json"]:
+                try:
+                    hf_hub_download(repo_id=repo_id, filename=filename)
+                except Exception:
+                    pass
+
+            # Download model (prefer safetensors)
+            for model_name in ["model.safetensors", "model.pt"]:
+                try:
+                    return hf_hub_download(repo_id=repo_id, filename=model_name)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            if self.verbose:
+                print(f"⚠️ HuggingFace download failed: {e}")
+
+        return repo_id
+
+    def _load_model(self, model_path: str) -> None:
+        """Load Transformer model from checkpoint."""
         cache_key = (str(model_path), self.device)
 
+        # Check cache
         if cache_key in OCR._model_cache:
             if self.verbose:
-                print(f"⚡ Loading from memory cache")
+                print("⚡ Loading from memory cache")
             cached = OCR._model_cache[cache_key]
             self.model = cached["model"]
             self.cfg = cached["cfg"]
@@ -153,77 +178,37 @@ class OCR:
             print(f"📦 Loading OCR model from {model_path}...")
 
         try:
-            is_safetensors = model_path.endswith('.safetensors')
-            
-            if is_safetensors and HAS_SAFETENSORS:
-                # Load safetensors format
-                state_dict = load_file(model_path, device=self.device)
-                
-                # Load metadata from JSON file
-                metadata_path = model_path.replace('.safetensors', '_meta.json')
-                self.cfg = CFG()
-                vocab_path = ""
-                
-                if Path(metadata_path).exists():
-                    with open(metadata_path, 'r') as f:
-                        metadata = json.load(f)
-                    vocab_path = metadata.get("vocab_path", "")
-                    config_data = metadata.get("config", {})
-                    if config_data:
-                        self.cfg.IMG_H = config_data.get("IMG_H", self.cfg.IMG_H)
-                        self.cfg.IMG_W = config_data.get("IMG_W", self.cfg.IMG_W)
-                        self.cfg.USE_CTC = config_data.get("USE_CTC", self.cfg.USE_CTC)
-                        self.cfg.USE_FP16 = config_data.get("USE_FP16", self.cfg.USE_FP16)
+            # Load checkpoint based on format
+            if model_path.endswith('.safetensors') and HAS_SAFETENSORS:
+                state_dict, vocab_path = self._load_safetensors(model_path)
             else:
-                # Load torch checkpoint
-                checkpoint = torch.load(
-                    model_path, map_location=self.device, weights_only=False
-                )
+                state_dict, vocab_path = self._load_torch_checkpoint(model_path)
 
-                # Extract config and state dict
-                if "config" in checkpoint:
-                    config_data = checkpoint["config"]
-                    # Convert dict to CFG object if needed
-                    if isinstance(config_data, dict):
-                        self.cfg = CFG()
-                        self.cfg.IMG_H = config_data.get("IMG_H", self.cfg.IMG_H)
-                        self.cfg.IMG_W = config_data.get("IMG_W", self.cfg.IMG_W)
-                        self.cfg.USE_CTC = config_data.get("USE_CTC", self.cfg.USE_CTC)
-                        self.cfg.USE_FP16 = config_data.get("USE_FP16", self.cfg.USE_FP16)
-                    else:
-                        self.cfg = config_data
-                    state_dict = checkpoint["model"]
-                    vocab_path = checkpoint.get("vocab_path", "")
-                else:
-                    self.cfg = CFG()
-                    state_dict = checkpoint
-                    vocab_path = ""
-
-            # Override FP16 setting if requested
+            # Override FP16 if requested
             if self.use_fp16 is not None:
                 self.cfg.USE_FP16 = self.use_fp16
 
-            # Find vocab file
+            # Find and load vocabulary
             vocab_path = self._find_vocab_file(vocab_path, model_path)
-
             if not vocab_path or not Path(vocab_path).exists():
                 raise FileNotFoundError(
-                    f"Could not find vocabulary file for model. "
-                    f"Expected near: {model_path}"
+                    f"Could not find vocabulary file. Expected near: {model_path}"
                 )
 
+            # Initialize model
             self.tokenizer = CharTokenizer(vocab_path, self.cfg)
             self.model = KiriOCR(self.cfg, self.tokenizer).to(self.device)
             self.model.load_state_dict(state_dict, strict=True)
             self.model.eval()
 
+            # Enable FP16 on CUDA
             if self.cfg.USE_FP16 and self.device == "cuda":
                 self.model.half()
 
             if self.verbose:
                 print(f"  ✓ Loaded (Vocab: {self.tokenizer.vocab_size} chars)")
 
-            # Cache
+            # Cache for future use
             OCR._model_cache[cache_key] = {
                 "model": self.model,
                 "cfg": self.cfg,
@@ -236,10 +221,56 @@ class OCR:
                 sys.exit(1)
             raise
 
-    def _find_vocab_file(self, vocab_path, model_path):
-        """Find vocabulary file for model"""
-        model_dir = Path(model_path).parent
+    def _load_safetensors(self, model_path: str) -> Tuple[Dict, str]:
+        """Load model from safetensors format."""
+        state_dict = load_file(model_path, device=self.device)
+        
+        # Initialize config
+        self.cfg = CFG()
+        vocab_path = ""
+        
+        # Load metadata if available
+        metadata_path = model_path.replace('.safetensors', '_meta.json')
+        if Path(metadata_path).exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            vocab_path = metadata.get("vocab_path", "")
+            self._apply_config(metadata.get("config", {}))
+        
+        return state_dict, vocab_path
 
+    def _load_torch_checkpoint(self, model_path: str) -> Tuple[Dict, str]:
+        """Load model from PyTorch checkpoint."""
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        
+        if "config" in checkpoint:
+            config_data = checkpoint["config"]
+            if isinstance(config_data, dict):
+                self.cfg = CFG()
+                self._apply_config(config_data)
+            else:
+                self.cfg = config_data
+            state_dict = checkpoint["model"]
+            vocab_path = checkpoint.get("vocab_path", "")
+        else:
+            self.cfg = CFG()
+            state_dict = checkpoint
+            vocab_path = ""
+        
+        return state_dict, vocab_path
+
+    def _apply_config(self, config_data: Dict) -> None:
+        """Apply configuration dict to CFG object."""
+        if not config_data:
+            return
+        self.cfg.IMG_H = config_data.get("IMG_H", self.cfg.IMG_H)
+        self.cfg.IMG_W = config_data.get("IMG_W", self.cfg.IMG_W)
+        self.cfg.USE_CTC = config_data.get("USE_CTC", self.cfg.USE_CTC)
+        self.cfg.USE_FP16 = config_data.get("USE_FP16", self.cfg.USE_FP16)
+
+    def _find_vocab_file(self, vocab_path: str, model_path: str) -> Optional[str]:
+        """Find vocabulary file for the model."""
+        model_dir = Path(model_path).parent
         candidates = [
             vocab_path,
             model_dir / Path(vocab_path).name if vocab_path else None,
@@ -247,21 +278,21 @@ class OCR:
             model_dir / "vocab_auto.json",
             model_dir / "vocab_char.json",
         ]
-
         for candidate in candidates:
             if candidate and Path(candidate).exists():
                 return str(candidate)
-
         return None
+
+    # ==================== Detection ====================
 
     @property
     def detector(self):
-        """Lazy-load detector"""
+        """Lazy-load text detector on first access."""
         if self._detector is None:
             from .detector import TextDetector
 
             det_path = self.det_model_path
-            # If no detector path specified, and we have a repo_id, and using DB/CRAFT
+            # Use repo_id for detector if not specified
             if det_path is None and self.repo_id and self.det_method in ["db", "craft"]:
                 det_path = self.repo_id
 
@@ -272,42 +303,107 @@ class OCR:
             )
         return self._detector
 
-    def _preprocess_region(self, img, box, extra_padding=5):
-        """Preprocess a cropped region for recognition"""
+    # ==================== Recognition ====================
+
+    def _preprocess_region(
+        self, 
+        img: np.ndarray, 
+        box: Tuple[int, int, int, int], 
+        extra_padding: int = 5
+    ) -> Optional[torch.Tensor]:
+        """
+        Preprocess a cropped region for recognition.
+        
+        Args:
+            img: Grayscale image array
+            box: Bounding box (x, y, w, h)
+            extra_padding: Additional padding around the box
+            
+        Returns:
+            Preprocessed tensor ready for model input, or None if invalid
+        """
         img_h, img_w = img.shape[:2]
         x, y, w, h = box
 
-        # Add padding
+        # Apply padding with bounds checking
         x1 = max(0, x - extra_padding)
         y1 = max(0, y - extra_padding)
         x2 = min(img_w, x + w + extra_padding)
         y2 = min(img_h, y + h + extra_padding)
 
         roi = img[y1:y2, x1:x2]
-
         if roi.size == 0:
             return None
 
-        # Ensure grayscale
+        # Convert to grayscale if needed
         if len(roi.shape) == 3:
             roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # Invert if dark background
+        # Invert if dark background (assume light text on dark)
         if np.mean(roi) < 127:
             roi = 255 - roi
 
         roi_pil = Image.fromarray(roi)
         return preprocess_pil(self.cfg, roi_pil)
 
-    def recognize_single_line_image(self, image_path):
-        """Recognize text from a single-line image (no detection)"""
+    def recognize_region(self, image_tensor: torch.Tensor) -> Tuple[str, float]:
+        """
+        Recognize text in a preprocessed image tensor.
+
+        Args:
+            image_tensor: Preprocessed image tensor from preprocess_pil()
+
+        Returns:
+            Tuple of (recognized_text, confidence_score)
+        """
+        image_tensor = image_tensor.to(self.device)
+
+        if self.cfg.USE_FP16 and self.device == "cuda":
+            image_tensor = image_tensor.half()
+
+        # Encode image
+        mem = self.model.encode(image_tensor)
+        mem_proj = self.model.mem_proj(mem)
+
+        # Get CTC logits for hybrid decoding
+        ctc_logits = None
+        if self.cfg.USE_CTC and hasattr(self.model, "ctc_head"):
+            ctc_logits = self.model.ctc_head(mem)
+
+        # Decode
+        if self.use_beam_search:
+            text, confidence = beam_decode_one_batched(
+                self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
+            )
+        else:
+            text, confidence = greedy_ctc_decode(
+                self.model, image_tensor, self.tokenizer, self.cfg
+            )
+
+        return text, confidence
+
+    def recognize_single_line_image(
+        self, 
+        image_path: Union[str, Path]
+    ) -> Tuple[str, float]:
+        """
+        Recognize text from a single-line image without detection.
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            Tuple of (recognized_text, confidence_score)
+        """
         img = cv2.imread(str(image_path))
         if img is None:
             raise ValueError(f"Could not load image: {image_path}")
 
+        # Convert to grayscale
         if len(img.shape) == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+        # Invert if dark background
         if np.mean(img) < 127:
             img = 255 - img
 
@@ -316,52 +412,35 @@ class OCR:
 
         return self.recognize_region(img_tensor)
 
-    def recognize_region(self, image_tensor):
+    # ==================== Document Processing ====================
+
+    def process_document(
+        self,
+        image_path: Union[str, Path],
+        mode: str = "lines",
+        verbose: bool = False,
+    ) -> List[Dict]:
         """
-        Recognize text in a preprocessed region.
+        Process a document image with detection and recognition.
+
+        Args:
+            image_path: Path to the document image
+            mode: Detection mode - 'lines' or 'words'
+            verbose: Enable verbose output
 
         Returns:
-            (text, confidence) tuple
-        """
-        image_tensor = image_tensor.to(self.device)
-
-        if self.cfg.USE_FP16 and self.device == "cuda":
-            image_tensor = image_tensor.half()
-
-        # Encode
-        mem = self.model.encode(image_tensor)
-        mem_proj = self.model.mem_proj(mem)
-
-        # Get CTC logits for fusion
-        ctc_logits = None
-        if self.cfg.USE_CTC and hasattr(self.model, "ctc_head"):
-            ctc_logits = self.model.ctc_head(mem)
-
-        if self.use_beam_search:
-            # Beam search (higher quality, slower)
-            text, confidence = beam_decode_one_batched(
-                self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
-            )
-        else:
-            # Greedy CTC (faster, simpler)
-            text, confidence = greedy_ctc_decode(
-                self.model, image_tensor, self.tokenizer, self.cfg
-            )
-
-        return text, confidence
-
-    def process_document(self, image_path, mode="lines", verbose=False):
-        """
-        Process entire document with detection + recognition.
-
-        Returns:
-            List of dicts with 'box', 'text', 'confidence', etc.
+            List of result dicts with keys:
+            - 'box': [x, y, w, h] bounding box
+            - 'text': Recognized text string
+            - 'confidence': Recognition confidence (0-1)
+            - 'det_confidence': Detection confidence (0-1)
+            - 'line_number': Sequential line number
         """
         if verbose:
             print(f"\n📄 Processing: {image_path}")
             print(f"🔲 Box padding: {self.padding}px")
 
-        # Detect regions
+        # Detect text regions
         if mode == "lines":
             if hasattr(self.detector, "detect_lines_objects"):
                 text_boxes = self.detector.detect_lines_objects(image_path)
@@ -377,12 +456,12 @@ class OCR:
         if verbose:
             print(f"🔍 Detected {len(boxes)} regions")
 
-        # Load image
+        # Load and prepare image
         img = cv2.imread(str(image_path))
-        if len(img.shape) == 3:
-            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            img_gray = img
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+            
+        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
 
         # Recognize each region
         results = []
@@ -394,15 +473,13 @@ class OCR:
 
                 text, confidence = self.recognize_region(region_tensor)
 
-                results.append(
-                    {
-                        "box": [int(v) for v in box],
-                        "text": text,
-                        "confidence": float(confidence),
-                        "det_confidence": float(det_conf),
-                        "line_number": i,
-                    }
-                )
+                results.append({
+                    "box": [int(v) for v in box],
+                    "text": text,
+                    "confidence": float(confidence),
+                    "det_confidence": float(det_conf),
+                    "line_number": i,
+                })
 
                 if verbose:
                     print(f"  {i:2d}. {text[:50]:50s} ({confidence*100:.1f}%)")
@@ -413,38 +490,59 @@ class OCR:
 
         return results
 
-    def extract_text(self, image_path, mode="lines", verbose=False):
-        """Extract all text from document as string"""
+    def extract_text(
+        self,
+        image_path: Union[str, Path],
+        mode: str = "lines",
+        verbose: bool = False,
+    ) -> Tuple[str, List[Dict]]:
+        """
+        Extract all text from a document image.
+
+        Args:
+            image_path: Path to the document image
+            mode: Detection mode - 'lines' or 'words'
+            verbose: Enable verbose output
+
+        Returns:
+            Tuple of:
+            - Full extracted text as string (lines joined by newlines)
+            - List of detailed result dicts from process_document()
+        """
         results = self.process_document(image_path, mode, verbose=verbose)
 
         if not results:
             return "", results
 
-        # Sort by Y then X for reading order
-        results.sort(key=lambda r: (r["box"][1], r["box"][0]))
-
+        # Group results into text lines based on vertical position
+        # Results are already sorted by detector in reading order
         lines = []
         current_line = []
-        prev_y = None
-        prev_h = None
+        prev_center_y = None
+        prev_height = None
 
         for res in results:
             y, h = res["box"][1], res["box"][3]
             center_y = y + h / 2
 
-            if prev_y is not None:
-                prev_center = prev_y + prev_h / 2
-                # Same line if centers are close
-                if abs(center_y - prev_center) < max(h, prev_h) / 2:
+            if prev_center_y is not None:
+                # Use 80% of max height as same-line tolerance
+                tolerance = max(h, prev_height) * 0.8
+                
+                if abs(center_y - prev_center_y) < tolerance:
+                    # Same line - append text
                     current_line.append(res["text"])
                 else:
+                    # New line - save current and start new
                     lines.append(" ".join(current_line))
                     current_line = [res["text"]]
             else:
                 current_line = [res["text"]]
 
-            prev_y, prev_h = y, h
+            prev_center_y = center_y
+            prev_height = h
 
+        # Don't forget the last line
         if current_line:
             lines.append(" ".join(current_line))
 

@@ -46,23 +46,6 @@ class TextDetector:
         self.craft_detector = None
         self.db_detector = None
         
-        # Resolve HuggingFace path
-        if model_path and "/" in model_path and not os.path.exists(model_path) and not model_path.startswith((".", "/")):
-             try:
-                 from huggingface_hub import hf_hub_download
-                 # Check for detector model in specific subfolder
-                 # Prefer detector/DB/detector.onnx as requested
-                 try:
-                     model_path = hf_hub_download(repo_id=model_path, filename="detector/DB/detector.onnx")
-                 except:
-                     try:
-                         # Fallback to detector/detector.onnx
-                         model_path = hf_hub_download(repo_id=model_path, filename="detector/detector.onnx")
-                     except:
-                         pass
-             except Exception as e:
-                 print(f"Warning: Could not download detector from HuggingFace: {e}")
-
         # Try to resolve model path if not provided
         if model_path is None:
              possible_paths = []
@@ -83,6 +66,27 @@ class TextDetector:
                  if os.path.exists(p):
                      model_path = p
                      break
+            
+             # If still no model path and method requires one, default to official repo
+             if model_path is None and self.method in ['db', 'craft']:
+                 model_path = "mrrtmob/kiri-ocr"
+
+        # Resolve HuggingFace path
+        if model_path and "/" in model_path and not os.path.exists(model_path) and not model_path.startswith((".", "/")):
+             try:
+                 from huggingface_hub import hf_hub_download
+                 # Check for detector model in specific subfolder
+                 # Prefer detector/DB/detector.onnx as requested
+                 try:
+                     model_path = hf_hub_download(repo_id=model_path, filename="detector/DB/detector.onnx")
+                 except:
+                     try:
+                         # Fallback to detector/detector.onnx
+                         model_path = hf_hub_download(repo_id=model_path, filename="detector/detector.onnx")
+                     except:
+                         pass
+             except Exception as e:
+                 print(f"Warning: Could not download detector from HuggingFace: {e}")
         
         self.model_path = model_path
         
@@ -112,9 +116,13 @@ class TextDetector:
                      if self.model_path and os.path.exists(self.model_path):
                          # Extract DB specific kwargs
                          db_kwargs = {k: v for k, v in self.kwargs.items() if k in [
+                             # New parameters
+                             'use_gpu', 'det_db_thresh', 'det_db_box_thresh',
+                             'det_db_unclip_ratio', 'max_side_len', 'min_size',
+                             # Legacy parameter aliases (backward compatibility)
                              'input_size', 'binary_threshold', 'polygon_threshold',
                              'max_candidates', 'unclip_ratio', 'padding_pct', 'padding_px',
-                             'padding_y_pct', 'padding_y_px'
+                             'padding_y_pct', 'padding_y_px', 'line_tolerance_ratio', 'debug'
                          ]}
                          self.db_detector = DBDetector(self.model_path, **db_kwargs)
                      else:
@@ -157,9 +165,8 @@ class TextDetector:
         elif self.method == 'db' and self.db_detector:
             try:
                 detected_boxes = self.db_detector.detect_text(image)
-                # _process_boxes returns [bbox]. I need to change it.
-                # I'll create a new method _process_boxes_objects
-                return self._process_boxes_objects(detected_boxes, merge=False)
+                # DB detector already returns sorted boxes, skip re-sorting
+                return self._process_boxes_objects(detected_boxes, merge=False, skip_sort=True)
             except Exception as e:
                 print(f"DB detection failed: {e}. Falling back to legacy.")
                 return self._wrap_legacy(self.legacy_detector.detect_lines(image))
@@ -174,7 +181,7 @@ class TextDetector:
         boxes = self._process_boxes_objects(detected_boxes, merge=merge)
         return [b.bbox for b in boxes]
 
-    def _process_boxes_objects(self, detected_boxes, merge=True) -> List[TextBox]:
+    def _process_boxes_objects(self, detected_boxes, merge=True, skip_sort=False) -> List[TextBox]:
         """Convert polygons to TextBoxes (returns objects)."""
         boxes = []
         padding = self.kwargs.get('padding', 0)
@@ -210,45 +217,58 @@ class TextDetector:
             
             boxes.append(TextBox(int(x1), int(y1), int(w), int(h), confidence=float(confidence), level=DetectionLevel.LINE))
         
-        boxes = self._sort_reading_order(boxes)
+        # Only sort if not already sorted (e.g., DB detector already sorts)
+        if not skip_sort:
+            boxes = self._sort_reading_order(boxes)
         if merge:
             boxes = self._merge_overlapping_boxes(boxes)
         return boxes
 
     def _sort_reading_order(self, boxes: List[TextBox]) -> List[TextBox]:
-        """Sort boxes from top-to-bottom, left-to-right."""
+        """Sort boxes from top-to-bottom, left-to-right using robust line grouping."""
         if not boxes:
             return []
             
         # Helper to get center y
         def get_cy(b): return b.y + b.height / 2
+        def get_cx(b): return b.x + b.width / 2
         
-        # Sort initially by Y
-        boxes.sort(key=lambda b: b.y)
+        # Sort initially by center Y
+        boxes.sort(key=get_cy)
         
-        sorted_boxes = []
+        # Calculate dynamic tolerance based on median height (more robust than average)
+        heights = [b.height for b in boxes]
+        median_h = float(np.median(heights)) if heights else 20.0
+        # Use 70% of median height as tolerance for line grouping
+        y_tolerance = median_h * 0.7
+        
+        # Group into lines
+        lines = []
         current_line = [boxes[0]]
-        current_cy = get_cy(boxes[0])
         
         for b in boxes[1:]:
             cy = get_cy(b)
-            # Threshold: half of the height of the current line's average height
-            avg_height = sum(lb.height for lb in current_line) / len(current_line)
+            # Calculate the average center Y of the current line
+            avg_line_cy = np.mean([get_cy(lb) for lb in current_line])
             
-            if abs(cy - current_cy) < avg_height / 2: # Same line
+            if abs(cy - avg_line_cy) < y_tolerance:
+                # Same line - add to current line
                 current_line.append(b)
             else:
-                # Sort current line by X
-                current_line.sort(key=lambda b: b.x)
-                sorted_boxes.extend(current_line)
-                
-                # Start new line
+                # New line - save current and start new
+                lines.append(current_line)
                 current_line = [b]
-                current_cy = cy
                 
-        # Flush last line
-        current_line.sort(key=lambda b: b.x)
-        sorted_boxes.extend(current_line)
+        # Don't forget the last line
+        if current_line:
+            lines.append(current_line)
+        
+        # Sort each line by X (left to right) and flatten
+        sorted_boxes = []
+        for line in lines:
+            # Sort boxes in this line by center X (left to right)
+            line.sort(key=get_cx)
+            sorted_boxes.extend(line)
         
         return sorted_boxes
 
@@ -356,3 +376,4 @@ def detect_text_blocks(image: Union[str, Path, np.ndarray], **kwargs) -> List[Tu
     """Convenience function to detect text blocks."""
     detector = TextDetector(**kwargs)
     return detector.detect_blocks(image)
+
