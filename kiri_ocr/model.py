@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple, NamedTuple
+from typing import Generator, List, Dict, Optional, Tuple, NamedTuple
 import json
 import math
 import numpy as np
@@ -601,3 +601,322 @@ def greedy_ctc_decode(
 
     confidence, text, _ = compute_ctc_confidence(ctc_logits, tok)
     return text, confidence
+
+
+# ========== STREAMING DECODER (CHARACTER-BY-CHARACTER) ==========
+@torch.inference_mode()
+def greedy_decode_streaming(
+    model: KiriOCR,
+    mem_proj_1: torch.Tensor,
+    tok: CharTokenizer,
+    cfg: CFG,
+    ctc_logits_1: Optional[torch.Tensor] = None,
+) -> Generator[Dict, None, None]:
+    """
+    Greedy autoregressive decoder that yields each character as it's generated.
+    
+    Similar to LLM text streaming - yields one token at a time during inference.
+    Uses greedy decoding (beam_size=1) for real-time streaming.
+    
+    Args:
+        model: The KiriOCR model
+        mem_proj_1: Projected encoder memory [1, T, D]
+        tok: Character tokenizer
+        cfg: Model configuration
+        ctc_logits_1: Optional CTC logits for length estimation
+        
+    Yields:
+        Dict with:
+        - 'token': The new character/token string
+        - 'token_id': The token ID
+        - 'text': Full decoded text so far
+        - 'confidence': Token probability
+        - 'step': Current step number
+        - 'finished': Whether decoding is complete
+    """
+    device = mem_proj_1.device
+    is_cuda = device.type == "cuda"
+    use_amp = cfg.USE_AUTOCAST and is_cuda
+    
+    # Estimate target length from CTC if available
+    target_len = None
+    if ctc_logits_1 is not None:
+        _, _, target_len = compute_ctc_confidence(ctc_logits_1, tok)
+    
+    # Calculate max decoding steps
+    if target_len and target_len > 0:
+        max_steps = min(
+            cfg.MAX_DEC_LEN,
+            int(target_len * cfg.DEC_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD,
+        )
+    else:
+        mem_len = mem_proj_1.size(1)
+        max_steps = min(
+            cfg.MAX_DEC_LEN, int(mem_len * cfg.MEM_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD
+        )
+    
+    # Initialize with BOS token
+    generated_ids = [tok.dec_bos]
+    generated_text = ""
+    log_probs = []
+    
+    # Pre-compute causal mask
+    full_causal = torch.triu(
+        torch.ones(
+            (cfg.MAX_DEC_LEN + 2, cfg.MAX_DEC_LEN + 2), device=device, dtype=torch.bool
+        ),
+        diagonal=1,
+    )
+    
+    unk_id = tok.unk_id + tok.dec_offset
+    
+    for step in range(max_steps):
+        # Prepare input sequence
+        seq_len = len(generated_ids)
+        inp = torch.tensor([generated_ids], device=device, dtype=torch.long)
+        
+        tgt = model.dec_emb(inp)
+        causal = full_causal[:seq_len, :seq_len]
+        
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            out = model.dec(tgt=tgt, memory=mem_proj_1, tgt_mask=causal)
+            out = model.dec_ln(out)
+            logits = model.dec_head(out)[:, -1, :]  # [1, vocab]
+            logp = F.log_softmax(logits, dim=-1)
+            
+            # Apply LM fusion if available
+            if cfg.USE_LM and cfg.USE_LM_FUSION_EVAL and hasattr(model, "lm_head"):
+                lm_logits = model.lm_head(out)[:, -1, :]
+                logp = logp + cfg.LM_FUSION_ALPHA * F.log_softmax(lm_logits, dim=-1)
+        
+        cur_len = len(generated_ids) - 1
+        
+        # EOS bias based on target length
+        if target_len and target_len > 0:
+            min_len = min(cfg.EOS_BIAS_UNTIL_LEN, max(1, int(target_len * 0.5)))
+            if cur_len < min_len:
+                logp[0, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
+            elif cur_len >= target_len:
+                logp[0, tok.dec_eos] += cfg.EOS_LOGP_BOOST
+        else:
+            if cur_len < cfg.EOS_BIAS_UNTIL_LEN:
+                logp[0, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
+        
+        # Repeat penalty
+        if len(generated_ids) >= 4:
+            if generated_ids[-1] == generated_ids[-2] == generated_ids[-3]:
+                logp[0, generated_ids[-1]] -= cfg.REPEAT_LAST_PENALTY
+        
+        # UNK penalty
+        logp[0, unk_id] -= cfg.UNK_LOGP_PENALTY
+        
+        # Get best token (greedy)
+        probs = F.softmax(logits, dim=-1)
+        best_prob, best_id = probs[0].max(dim=0)
+        best_id = best_id.item()
+        best_logp = logp[0, best_id].item()
+        
+        # Check if finished
+        is_finished = best_id == tok.dec_eos
+        
+        # Decode character
+        if not is_finished and best_id not in (tok.dec_pad, tok.dec_bos, tok.dec_eos):
+            raw_id = best_id - tok.dec_offset
+            if 0 <= raw_id < tok.vocab_size:
+                char = tok.id_to_token.get(raw_id, "")
+                if char != tok.unk_token:
+                    generated_text += char
+        else:
+            char = ""
+        
+        generated_ids.append(best_id)
+        log_probs.append(best_logp)
+        
+        yield {
+            "token": char,
+            "token_id": best_id,
+            "text": generated_text,
+            "confidence": best_prob.item(),
+            "step": step + 1,
+            "finished": is_finished,
+        }
+        
+        if is_finished:
+            break
+
+
+@torch.inference_mode()
+def beam_decode_streaming(
+    model: KiriOCR,
+    mem_proj_1: torch.Tensor,
+    tok: CharTokenizer,
+    cfg: CFG,
+    ctc_logits_1: Optional[torch.Tensor] = None,
+) -> Generator[Dict, None, None]:
+    """
+    Beam search decoder that yields the current best hypothesis at each step.
+    
+    Provides higher quality than greedy decoding while still streaming.
+    At each step, yields the best partial result from the beam.
+    
+    Args:
+        model: The KiriOCR model
+        mem_proj_1: Projected encoder memory [1, T, D]
+        tok: Character tokenizer
+        cfg: Model configuration
+        ctc_logits_1: Optional CTC logits for length estimation
+        
+    Yields:
+        Dict with:
+        - 'token': The new character (may change in later steps due to beam search!)
+        - 'text': Current best decoded text
+        - 'confidence': Current confidence estimate
+        - 'step': Current step number
+        - 'finished': Whether decoding is complete
+    """
+    device = mem_proj_1.device
+    is_cuda = device.type == "cuda"
+    
+    # Get CTC info for length estimation
+    ctc_confidence = None
+    target_len = None
+    
+    if ctc_logits_1 is not None:
+        ctc_confidence, _, target_len = compute_ctc_confidence(ctc_logits_1, tok)
+    
+    # Calculate max decoding steps
+    if target_len and target_len > 0:
+        max_steps = min(
+            cfg.MAX_DEC_LEN,
+            int(target_len * cfg.DEC_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD,
+        )
+    else:
+        mem_len = mem_proj_1.size(1)
+        max_steps = min(
+            cfg.MAX_DEC_LEN, int(mem_len * cfg.MEM_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD
+        )
+    
+    # Beam state: (score, token_ids, token_logprobs, finished)
+    beams: List[Tuple[float, List[int], List[float], bool]] = [
+        (0.0, [tok.dec_bos], [], False)
+    ]
+    
+    full_causal = torch.triu(
+        torch.ones(
+            (cfg.MAX_DEC_LEN + 2, cfg.MAX_DEC_LEN + 2), device=device, dtype=torch.bool
+        ),
+        diagonal=1,
+    )
+    
+    use_amp = cfg.USE_AUTOCAST and is_cuda
+    prev_best_text = ""
+    
+    for step in range(max_steps):
+        if all(b[3] for b in beams):
+            break
+        
+        alive = [b for b in beams if not b[3]]
+        done = [b for b in beams if b[3]]
+        
+        if not alive:
+            beams = done
+            break
+        
+        maxL = max(len(b[1]) for b in alive)
+        B = len(alive)
+        
+        inp = torch.full((B, maxL), tok.dec_pad, device=device, dtype=torch.long)
+        for i, (_, seq, _, _) in enumerate(alive):
+            inp[i, : len(seq)] = torch.tensor(seq, device=device, dtype=torch.long)
+        
+        tgt = model.dec_emb(inp)
+        causal = full_causal[:maxL, :maxL]
+        
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            out = model.dec(
+                tgt=tgt, memory=mem_proj_1.expand(B, -1, -1), tgt_mask=causal
+            )
+            out = model.dec_ln(out)
+            logits = model.dec_head(out)[:, -1, :]
+            logp = F.log_softmax(logits, dim=-1)
+            
+            if cfg.USE_LM and cfg.USE_LM_FUSION_EVAL and hasattr(model, "lm_head"):
+                lm_logits = model.lm_head(out)[:, -1, :]
+                logp = logp + cfg.LM_FUSION_ALPHA * F.log_softmax(lm_logits, dim=-1)
+        
+        # Apply penalties
+        unk_id = tok.unk_id + tok.dec_offset
+        
+        for i, (_, seq, _, _) in enumerate(alive):
+            cur_len = len(seq) - 1
+            
+            if target_len and target_len > 0:
+                min_len = min(cfg.EOS_BIAS_UNTIL_LEN, max(1, int(target_len * 0.5)))
+                if cur_len < min_len:
+                    logp[i, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
+                elif cur_len >= target_len:
+                    logp[i, tok.dec_eos] += cfg.EOS_LOGP_BOOST
+            else:
+                if cur_len < cfg.EOS_BIAS_UNTIL_LEN:
+                    logp[i, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
+            
+            if len(seq) >= 4 and seq[-1] == seq[-2] == seq[-3]:
+                logp[i, seq[-1]] -= cfg.REPEAT_LAST_PENALTY
+            
+            logp[i, unk_id] -= cfg.UNK_LOGP_PENALTY
+        
+        topv, topi = torch.topk(logp, k=cfg.BEAM, dim=-1)
+        
+        # Expand beams
+        new_beams: List[Tuple[float, List[int], List[float], bool]] = list(done)
+        
+        for bi, (base_score, seq, logprobs, _) in enumerate(alive):
+            for v, tid in zip(topv[bi].tolist(), topi[bi].tolist()):
+                new_seq = seq + [int(tid)]
+                new_logprobs = logprobs + [float(v)]
+                is_finished = int(tid) == tok.dec_eos
+                new_score = base_score + float(v)
+                new_beams.append((new_score, new_seq, new_logprobs, is_finished))
+        
+        # Length-normalized scoring
+        def normed(entry):
+            score, seq, _, _ = entry
+            L = max(1, len(seq) - 1)
+            return score / (L ** cfg.BEAM_LENP)
+        
+        new_beams.sort(key=normed, reverse=True)
+        beams = new_beams[: cfg.BEAM]
+        
+        # Get current best beam for streaming output
+        best_beam = beams[0]
+        _, best_seq, best_logprobs, best_finished = best_beam
+        
+        # Decode current best text
+        ids = []
+        for x in best_seq[1:]:
+            if x == tok.dec_eos:
+                break
+            ids.append(x)
+        current_text = tok.decode_dec(ids)
+        
+        # Find new token
+        if len(current_text) > len(prev_best_text):
+            new_token = current_text[len(prev_best_text):]
+        else:
+            new_token = ""
+        
+        # Compute confidence
+        confidence = compute_sequence_confidence(best_logprobs) if best_logprobs else 0.0
+        
+        yield {
+            "token": new_token,
+            "text": current_text,
+            "confidence": confidence,
+            "step": step + 1,
+            "finished": best_finished,
+        }
+        
+        prev_best_text = current_text
+        
+        if best_finished:
+            break
