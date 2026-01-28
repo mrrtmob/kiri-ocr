@@ -54,8 +54,8 @@ class DBDetector:
         input_size: Optional[Tuple[int, int]] = None,
         max_candidates: int = 1000,
         # Padding parameters (for compatibility)
-        padding_pct: float = 0.10,
-        padding_px: int = 20,
+        padding_pct: float = 0.01,
+        padding_px: int = 5,
         padding_y_pct: float = 0.05,
         padding_y_px: int = 5,
         line_tolerance_ratio: float = 0.7,

@@ -59,9 +59,6 @@ kiri-ocr predict document.jpg --output results/
 
 # Or simply
 kiri-ocr document.jpg
-
-# Stream text character-by-character (LLM style) ⚡
-kiri-ocr predict document.jpg --stream
 ```
 
 ### Python API
@@ -92,26 +89,6 @@ ocr = OCR(device='cuda')
 # Recognize a single text line image
 text, confidence = ocr.recognize_single_line_image('text_line.png')
 print(f"'{text}' ({confidence:.1%})")
-```
-
-### Streaming API (Real-time)
-
-Stream output character-by-character, similar to LLM text generation:
-
-```python
-from kiri_ocr import OCR
-
-ocr = OCR()
-
-# Stream full document
-for chunk in ocr.extract_text_stream_chars('document.jpg'):
-    if chunk['region_start']:
-        print(f"\n[Region {chunk['region_number']}] ", end='')
-    print(chunk['token'], end='', flush=True)
-
-# Stream single line image
-for chunk in ocr.recognize_streaming('line.png'):
-    print(chunk['token'], end='', flush=True)
 ```
 
 ---
@@ -161,19 +138,19 @@ kiri-ocr train \
 
 ### Training Arguments
 
-| Argument         | Default | Description                                         |
-| ---------------- | ------- | --------------------------------------------------- |
-| `--height`       | 48      | Image height                                        |
-| `--width`        | 640     | Image width                                         |
-| `--batch-size`   | 32      | Training batch size                                 |
-| `--epochs`       | 100     | Number of training epochs                           |
-| `--lr`           | 0.0003  | Learning rate                                       |
-| `--ctc-weight`   | 0.5     | Weight for CTC loss                                 |
-| `--dec-weight`   | 0.5     | Weight for decoder loss                             |
-| `--vocab`        | Auto    | Path to vocab.json (auto-generated if not provided) |
-| `--save-steps`   | 1000    | Save checkpoint every N steps                       |
-| `--max-seq-len`  | 512     | Maximum decoder sequence length (prevents OOM)      |
-| `--resume`       | False   | Resume from latest checkpoint                       |
+| Argument          | Default | Description                                         |
+| ----------------- | ------- | --------------------------------------------------- |
+| `--height`      | 48      | Image height                                        |
+| `--width`       | 640     | Image width                                         |
+| `--batch-size`  | 32      | Training batch size                                 |
+| `--epochs`      | 100     | Number of training epochs                           |
+| `--lr`          | 0.0003  | Learning rate                                       |
+| `--ctc-weight`  | 0.5     | Weight for CTC loss                                 |
+| `--dec-weight`  | 0.5     | Weight for decoder loss                             |
+| `--vocab`       | Auto    | Path to vocab.json (auto-generated if not provided) |
+| `--save-steps`  | 1000    | Save checkpoint every N steps                       |
+| `--max-seq-len` | 512     | Maximum decoder sequence length (prevents OOM)      |
+| `--resume`      | False   | Resume from latest checkpoint                       |
 
 ### Resume Training
 
