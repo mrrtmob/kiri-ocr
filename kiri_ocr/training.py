@@ -19,9 +19,10 @@ import math
 import itertools
 
 try:
-    from datasets import load_dataset
+    from datasets import load_dataset, concatenate_datasets
 except ImportError:
     load_dataset = None
+    concatenate_datasets = None
 
 try:
     from safetensors.torch import save_file, load_file
@@ -339,31 +340,62 @@ def train_command(args):
     hf_ds_val = None
 
     if hasattr(args, "hf_dataset") and args.hf_dataset:
-        print(f"\n📥 Loading HF dataset: {args.hf_dataset}")
+        print(f"\n📥 Loading HF dataset(s): {args.hf_dataset}")
         subset = getattr(args, "hf_subset", None)
-        try:
-            hf_ds_train = load_dataset(
-                args.hf_dataset, subset, split=args.hf_train_split
-            )
+        
+        train_datasets = []
+        val_datasets = []
+        
+        # Ensure it's a list (might be string if from config file)
+        dataset_list = args.hf_dataset if isinstance(args.hf_dataset, list) else [args.hf_dataset]
 
-            # Try to load validation split
-            val_splits = [
-                getattr(args, "hf_val_split", None),
-                "validation",
-                "val",
-                "test",
-            ]
-            for split in val_splits:
-                if split:
-                    try:
-                        hf_ds_val = load_dataset(args.hf_dataset, subset, split=split)
-                        print(f"   ✓ Found validation split: {split}")
-                        break
-                    except:
-                        pass
-        except Exception as e:
-            print(f"❌ Error loading dataset: {e}")
-            return
+        for ds_name in dataset_list:
+            try:
+                # Load training split
+                ds_train = load_dataset(
+                    ds_name, subset, split=args.hf_train_split
+                )
+                train_datasets.append(ds_train)
+                print(f"   ✓ Loaded {ds_name} (train)")
+
+                # Try to load validation split
+                val_splits = [
+                    getattr(args, "hf_val_split", None),
+                    "validation",
+                    "val",
+                    "test",
+                ]
+                for split in val_splits:
+                    if split:
+                        try:
+                            ds_val = load_dataset(ds_name, subset, split=split)
+                            val_datasets.append(ds_val)
+                            print(f"   ✓ Found validation split for {ds_name}: {split}")
+                            break
+                        except:
+                            pass
+            except Exception as e:
+                print(f"❌ Error loading dataset {ds_name}: {e}")
+        
+        # Concatenate training datasets
+        if train_datasets:
+            if len(train_datasets) > 1 and concatenate_datasets:
+                hf_ds_train = concatenate_datasets(train_datasets)
+                print(f"   ✓ Concatenated {len(train_datasets)} training datasets")
+            else:
+                hf_ds_train = train_datasets[0]
+        
+        # Concatenate validation datasets
+        if val_datasets:
+            if len(val_datasets) > 1 and concatenate_datasets:
+                hf_ds_val = concatenate_datasets(val_datasets)
+                print(f"   ✓ Concatenated {len(val_datasets)} validation datasets")
+            else:
+                hf_ds_val = val_datasets[0]
+        
+        if not hf_ds_train:
+             print("❌ No valid datasets loaded")
+             return
 
     if not vocab_path or not os.path.exists(vocab_path):
         generated_vocab_path = os.path.join(args.output_dir, "vocab.json")
