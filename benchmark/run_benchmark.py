@@ -44,11 +44,11 @@ def main():
     print(f"Using device: {device}")
     
     try:
-        model_path = 'models/model.kiri'
+        model_path = 'models/model.safetensors'
         if not os.path.exists(model_path):
              print(f"Warning: {model_path} not found.")
         
-        ocr = OCR(device=device)
+        ocr = OCR(device=device, model_path=model_path)
     except Exception as e:
         print(f"Failed to load model: {e}")
         sys.exit(1)
