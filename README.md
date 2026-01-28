@@ -152,6 +152,69 @@ kiri-ocr train \
 | `--max-seq-len` | 512     | Maximum decoder sequence length (prevents OOM)      |
 | `--resume`      | False   | Resume from latest checkpoint                       |
 
+### Customizing Model Architecture
+
+You can customize the Transformer encoder and decoder architecture:
+
+| Argument            | Default | Description                        |
+| ------------------- | ------- | ---------------------------------- |
+| `--encoder-dim`     | 256     | Encoder hidden dimension           |
+| `--encoder-heads`   | 8       | Encoder attention heads            |
+| `--encoder-layers`  | 4       | Number of encoder layers           |
+| `--encoder-ffn-dim` | 1024    | Encoder feedforward dimension      |
+| `--decoder-dim`     | 256     | Decoder hidden dimension           |
+| `--decoder-heads`   | 8       | Decoder attention heads            |
+| `--decoder-layers`  | 3       | Number of decoder layers           |
+| `--decoder-ffn-dim` | 1024    | Decoder feedforward dimension      |
+| `--dropout`         | 0.15    | Dropout rate                       |
+
+#### Small Model (Fast, Low Memory)
+
+```bash
+kiri-ocr train \
+    --hf-dataset mrrtmob/khmer_english_ocr_image_line \
+    --encoder-dim 128 \
+    --encoder-layers 3 \
+    --encoder-ffn-dim 512 \
+    --decoder-dim 128 \
+    --decoder-layers 2 \
+    --decoder-ffn-dim 512 \
+    --batch-size 128 \
+    --device cuda
+```
+
+#### Large Model (Higher Accuracy, More Memory)
+
+```bash
+kiri-ocr train \
+    --hf-dataset mrrtmob/khmer_english_ocr_image_line \
+    --encoder-dim 512 \
+    --encoder-layers 8 \
+    --encoder-ffn-dim 2048 \
+    --decoder-dim 512 \
+    --decoder-layers 6 \
+    --decoder-ffn-dim 2048 \
+    --batch-size 8 \
+    --device cuda
+```
+
+#### Model Size Reference
+
+| Config        | Params | VRAM   | Speed    | Use Case                      |
+| ------------- | ------ | ------ | -------- | ----------------------------- |
+| Tiny (128)    | ~2M    | ~500MB | Fast     | Mobile, embedded              |
+| Small (256)   | ~8M    | ~2GB   | Medium   | Default, good balance         |
+| Medium (384)  | ~18M   | ~4GB   | Slower   | Higher accuracy               |
+| Large (512)   | ~32M   | ~8GB   | Slow     | Best accuracy                 |
+| XL (768)      | ~72M   | ~16GB  | Very Slow | Complex scripts (Khmer, CJK) |
+
+**Tips:**
+- `encoder_dim` must be divisible by `encoder_heads`
+- FFN dimension is typically 4x the hidden dimension
+- Match encoder/decoder dims for better results
+- Reduce `--batch-size` when using larger models
+- More layers = better quality but slower training
+
 ### Resume Training
 
 If training is interrupted:
@@ -367,6 +430,17 @@ dec_weight: 0.5
 
 # Sequence length limit (prevents OOM with long texts)
 max_seq_len: 512
+
+# Model Architecture (optional - uses defaults if not specified)
+encoder_dim: 256
+encoder_heads: 8
+encoder_layers: 4
+encoder_ffn_dim: 1024
+decoder_dim: 256
+decoder_heads: 8
+decoder_layers: 3
+decoder_ffn_dim: 1024
+dropout: 0.15
 
 # Paths
 output_dir: output

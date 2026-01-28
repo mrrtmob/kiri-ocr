@@ -424,6 +424,42 @@ def train_command(args):
     cfg.IMG_H = getattr(args, "height", 48)
     cfg.IMG_W = getattr(args, "width", 640)
 
+    # ========== APPLY ARCHITECTURE CLI ARGS ==========
+    # Encoder architecture
+    if hasattr(args, "encoder_dim") and args.encoder_dim:
+        cfg.ENC_DIM = args.encoder_dim
+    if hasattr(args, "encoder_heads") and args.encoder_heads:
+        cfg.ENC_HEADS = args.encoder_heads
+    if hasattr(args, "encoder_layers") and args.encoder_layers:
+        cfg.ENC_LAYERS = args.encoder_layers
+    if hasattr(args, "encoder_ffn_dim") and args.encoder_ffn_dim:
+        cfg.ENC_FF = args.encoder_ffn_dim
+
+    # Decoder architecture
+    if hasattr(args, "decoder_dim") and args.decoder_dim:
+        cfg.DEC_DIM = args.decoder_dim
+    if hasattr(args, "decoder_heads") and args.decoder_heads:
+        cfg.DEC_HEADS = args.decoder_heads
+    if hasattr(args, "decoder_layers") and args.decoder_layers:
+        cfg.DEC_LAYERS = args.decoder_layers
+    if hasattr(args, "decoder_ffn_dim") and args.decoder_ffn_dim:
+        cfg.DEC_FF = args.decoder_ffn_dim
+
+    # Regularization
+    if hasattr(args, "dropout") and args.dropout is not None:
+        cfg.DROPOUT = args.dropout
+
+    # Validate architecture constraints
+    if cfg.ENC_DIM % cfg.ENC_HEADS != 0:
+        print(f"⚠️  Warning: encoder_dim ({cfg.ENC_DIM}) must be divisible by encoder_heads ({cfg.ENC_HEADS})")
+        print(f"   Adjusting encoder_heads to {cfg.ENC_DIM // (cfg.ENC_DIM // cfg.ENC_HEADS)}")
+        cfg.ENC_HEADS = max(1, cfg.ENC_DIM // (cfg.ENC_DIM // cfg.ENC_HEADS))
+    
+    if cfg.DEC_DIM % cfg.DEC_HEADS != 0:
+        print(f"⚠️  Warning: decoder_dim ({cfg.DEC_DIM}) must be divisible by decoder_heads ({cfg.DEC_HEADS})")
+        print(f"   Adjusting decoder_heads to {cfg.DEC_DIM // (cfg.DEC_DIM // cfg.DEC_HEADS)}")
+        cfg.DEC_HEADS = max(1, cfg.DEC_DIM // (cfg.DEC_DIM // cfg.DEC_HEADS))
+
     try:
         tokenizer = CharTokenizer(vocab_path, cfg)
         print(f"\n📝 Vocabulary: {tokenizer.vocab_size} characters")
@@ -434,11 +470,16 @@ def train_command(args):
         return
 
     # ========== 3. MODEL ==========
+    print(f"\n🏗️  Model Architecture:")
+    print(f"   Encoder: dim={cfg.ENC_DIM}, heads={cfg.ENC_HEADS}, layers={cfg.ENC_LAYERS}, ffn={cfg.ENC_FF}")
+    print(f"   Decoder: dim={cfg.DEC_DIM}, heads={cfg.DEC_HEADS}, layers={cfg.DEC_LAYERS}, ffn={cfg.DEC_FF}")
+    print(f"   Dropout: {cfg.DROPOUT}")
+
     model = KiriOCR(cfg, tokenizer).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(
-        f"\n🏗️  Model: {total_params:,} parameters ({total_params * 4 / 1024 / 1024:.1f} MB)"
+        f"   Total: {total_params:,} parameters ({total_params * 4 / 1024 / 1024:.1f} MB)"
     )
 
     # Load pretrained weights if specified

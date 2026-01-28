@@ -402,6 +402,67 @@ def main():
     # Device
     train_parser.add_argument("--device", choices=["cpu", "cuda"], default=None)
 
+    # ========== MODEL ARCHITECTURE ==========
+    # Encoder architecture
+    train_parser.add_argument(
+        "--encoder-dim",
+        type=int,
+        default=None,
+        help="Encoder hidden dimension (default: 256)",
+    )
+    train_parser.add_argument(
+        "--encoder-heads",
+        type=int,
+        default=None,
+        help="Encoder attention heads (default: 8)",
+    )
+    train_parser.add_argument(
+        "--encoder-layers",
+        type=int,
+        default=None,
+        help="Number of encoder layers (default: 4)",
+    )
+    train_parser.add_argument(
+        "--encoder-ffn-dim",
+        type=int,
+        default=None,
+        help="Encoder feedforward dimension (default: 1024)",
+    )
+
+    # Decoder architecture
+    train_parser.add_argument(
+        "--decoder-dim",
+        type=int,
+        default=None,
+        help="Decoder hidden dimension (default: 256)",
+    )
+    train_parser.add_argument(
+        "--decoder-heads",
+        type=int,
+        default=None,
+        help="Decoder attention heads (default: 8)",
+    )
+    train_parser.add_argument(
+        "--decoder-layers",
+        type=int,
+        default=None,
+        help="Number of decoder layers (default: 3)",
+    )
+    train_parser.add_argument(
+        "--decoder-ffn-dim",
+        type=int,
+        default=None,
+        help="Decoder feedforward dimension (default: 1024)",
+    )
+
+    # Regularization
+    train_parser.add_argument(
+        "--dropout",
+        type=float,
+        default=None,
+        help="Dropout rate (default: 0.15)",
+    )
+
     # ========== GENERATE ==========
     gen_parser = subparsers.add_parser(
         "generate", help="🎨 Generate synthetic training data"
