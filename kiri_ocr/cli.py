@@ -332,7 +332,8 @@ def main():
     train_parser.add_argument("--val-labels", help="Path to validation labels.txt")
 
     # HuggingFace dataset
-    train_parser.add_argument("--hf-dataset", help="HuggingFace dataset ID")
+    # train_parser.add_argument("--hf-dataset", help="HuggingFace dataset ID")
+    train_parser.add_argument("--hf-dataset", "--hf-datasets", nargs="+", help="HuggingFace dataset ID(s)")
     train_parser.add_argument("--hf-subset", help="Dataset subset/config")
     train_parser.add_argument("--hf-train-split", default="train")
     train_parser.add_argument("--hf-val-split", default=None)
