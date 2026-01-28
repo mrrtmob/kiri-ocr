@@ -27,7 +27,7 @@ class CFG:
     # --- Model Architecture ---
     IMG_H: int = 48
     IMG_W: int = 640
-    MAX_DEC_LEN: int = 260
+    MAX_DEC_LEN: int = 512
     UNK_TOKEN: str = "<unk>"
     COLLAPSE_WHITESPACE: bool = True
     UNICODE_NFC: bool = True
