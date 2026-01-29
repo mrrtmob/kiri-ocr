@@ -820,33 +820,61 @@ def train_command(args):
         # ========== VALIDATION ==========
         val_loss = 0
         val_acc = 0
+        val_dec_acc = 0
 
         if val_loader:
             model.eval()
             val_total = 0
-            val_correct = 0
+            val_ctc_correct = 0
+            val_dec_correct = 0
 
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc="Validating", leave=False):
                     imgs = batch["images"].to(device)
                     texts = batch["texts"]
 
-                    # Use CTC greedy decode for validation
                     for i in range(imgs.size(0)):
                         try:
-                            pred_text, conf = greedy_ctc_decode(
+                            # CTC validation
+                            pred_ctc, _ = greedy_ctc_decode(
                                 model, imgs[i : i + 1], tokenizer, cfg
                             )
-                            if pred_text.strip() == texts[i].strip():
-                                val_correct += 1
-                        except:
+                            if pred_ctc.strip() == texts[i].strip():
+                                val_ctc_correct += 1
+                            
+                            # Decoder validation (using beam_decode_one_batched with beam=1)
+                            from .model import beam_decode_one_batched
+                            mem = model.encode(imgs[i : i + 1])
+                            mem_proj = model.mem_proj(mem)
+                            ctc_logits = model.ctc_head(mem) if cfg.USE_CTC else None
+                            
+                            old_beam = cfg.BEAM
+                            cfg.BEAM = 1  # Greedy for speed
+                            pred_dec, _ = beam_decode_one_batched(
+                                model, mem_proj, tokenizer, cfg, ctc_logits_1=ctc_logits
+                            )
+                            cfg.BEAM = old_beam
+                            
+                            if pred_dec.strip() == texts[i].strip():
+                                val_dec_correct += 1
+                        except Exception as e:
                             pass
                         val_total += 1
 
-            val_acc = val_correct / max(1, val_total) * 100
-            print(f"    Val Accuracy: {val_acc:.2f}% ({val_correct}/{val_total})")
+            val_acc = val_ctc_correct / max(1, val_total) * 100
+            val_dec_acc = val_dec_correct / max(1, val_total) * 100
+            print(f"    Val CTC Accuracy: {val_acc:.2f}% ({val_ctc_correct}/{val_total})")
+            print(f"    Val Decoder Accuracy: {val_dec_acc:.2f}% ({val_dec_correct}/{val_total})")
+            
+            # Alert if decoder is significantly worse than CTC
+            if val_acc - val_dec_acc > 10:
+                print(f"    ⚠️  Decoder ({val_dec_acc:.1f}%) is underperforming CTC ({val_acc:.1f}%)")
+                print(f"       Consider increasing --dec_weight (current effective loss balance)")
 
             history["val_loss"].append(val_acc)
+            if "val_dec_acc" not in history:
+                history["val_dec_acc"] = []
+            history["val_dec_acc"].append(val_dec_acc)
 
         # Save epoch checkpoint
         save_checkpoint(

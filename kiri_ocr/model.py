@@ -53,13 +53,15 @@ class CFG:
     # --- Inference Params ---
     CTC_FUSION_ALPHA: float = 0.35
     BEAM: int = 4
-    BEAM_LENP: float = 0.75 
+    BEAM_LENP: float = 0.75
 
     EOS_LOGP_BIAS: float = 0.55
     EOS_LOGP_BOOST: float = 0.65
     EOS_BIAS_UNTIL_LEN: int = 28
 
-    REPEAT_LAST_PENALTY: float = 1.0
+    REPEAT_LAST_PENALTY: float = 2.0      # Penalty for exact token repeat
+    REPEAT_BIGRAM_PENALTY: float = 1.5    # Penalty for bi-gram repeat (e.g. AB-AB)
+    REPEAT_TRIGRAM_PENALTY: float = 1.2   # Penalty for tri-gram repeat
     UNK_LOGP_PENALTY: float = 1.0
 
     DEC_MAX_LEN_RATIO: float = 1.35
@@ -446,9 +448,34 @@ def beam_decode_one_batched(
                 if cur_len < cfg.EOS_BIAS_UNTIL_LEN:
                     logp[i, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
 
-            # Repeat penalty
-            if len(seq) >= 4 and seq[-1] == seq[-2] == seq[-3]:
+            # Repeat penalty - multiple patterns
+            n = len(seq)
+            
+            # 1. Exact token repeat (e.g., AAA)
+            if n >= 4 and seq[-1] == seq[-2] == seq[-3]:
                 logp[i, seq[-1]] -= cfg.REPEAT_LAST_PENALTY
+            
+            # 2. Bi-gram repeat (e.g., AB-AB)
+            if n >= 4:
+                last_bigram = (seq[-2], seq[-1])
+                prev_bigram = (seq[-4], seq[-3])
+                if last_bigram == prev_bigram:
+                    logp[i, seq[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
+                    logp[i, seq[-2]] -= cfg.REPEAT_BIGRAM_PENALTY
+            
+            # 3. Check for AB pattern starting to repeat (A-B-A)
+            if n >= 3 and seq[-1] == seq[-3]:
+                if n >= 4 and seq[-2] == seq[-4]:
+                    logp[i, seq[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
+            
+            # 4. Tri-gram repeat (e.g., ABC-ABC)
+            if n >= 6:
+                last_trigram = (seq[-3], seq[-2], seq[-1])
+                prev_trigram = (seq[-6], seq[-5], seq[-4])
+                if last_trigram == prev_trigram:
+                    logp[i, seq[-1]] -= cfg.REPEAT_TRIGRAM_PENALTY
+                    logp[i, seq[-2]] -= cfg.REPEAT_TRIGRAM_PENALTY
+                    logp[i, seq[-3]] -= cfg.REPEAT_TRIGRAM_PENALTY
 
             # UNK penalty
             logp[i, unk_id] -= cfg.UNK_LOGP_PENALTY
@@ -790,10 +817,36 @@ def greedy_decode_streaming(
             if cur_len < cfg.EOS_BIAS_UNTIL_LEN:
                 logp[0, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
         
-        # Repeat penalty
-        if len(generated_ids) >= 4:
-            if generated_ids[-1] == generated_ids[-2] == generated_ids[-3]:
-                logp[0, generated_ids[-1]] -= cfg.REPEAT_LAST_PENALTY
+        # Repeat penalty - multiple patterns
+        n = len(generated_ids)
+        
+        # 1. Exact token repeat (e.g., AAA)
+        if n >= 4 and generated_ids[-1] == generated_ids[-2] == generated_ids[-3]:
+            logp[0, generated_ids[-1]] -= cfg.REPEAT_LAST_PENALTY
+        
+        # 2. Bi-gram repeat (e.g., AB-AB -> penalize next A or B)
+        if n >= 4:
+            last_bigram = (generated_ids[-2], generated_ids[-1])
+            prev_bigram = (generated_ids[-4], generated_ids[-3])
+            if last_bigram == prev_bigram:
+                # Penalize both tokens of the bigram
+                logp[0, generated_ids[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
+                logp[0, generated_ids[-2]] -= cfg.REPEAT_BIGRAM_PENALTY
+        
+        # 3. Check for AB pattern starting to repeat (A-B-A)
+        if n >= 3 and generated_ids[-1] == generated_ids[-3]:
+            # Current might be forming AB-AB pattern, penalize repeating the cycle
+            if n >= 4 and generated_ids[-2] == generated_ids[-4]:
+                logp[0, generated_ids[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
+        
+        # 4. Tri-gram repeat (e.g., ABC-ABC)
+        if n >= 6:
+            last_trigram = (generated_ids[-3], generated_ids[-2], generated_ids[-1])
+            prev_trigram = (generated_ids[-6], generated_ids[-5], generated_ids[-4])
+            if last_trigram == prev_trigram:
+                logp[0, generated_ids[-1]] -= cfg.REPEAT_TRIGRAM_PENALTY
+                logp[0, generated_ids[-2]] -= cfg.REPEAT_TRIGRAM_PENALTY
+                logp[0, generated_ids[-3]] -= cfg.REPEAT_TRIGRAM_PENALTY
         
         # UNK penalty
         logp[0, unk_id] -= cfg.UNK_LOGP_PENALTY
@@ -948,8 +1001,34 @@ def beam_decode_streaming(
                 if cur_len < cfg.EOS_BIAS_UNTIL_LEN:
                     logp[i, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
             
-            if len(seq) >= 4 and seq[-1] == seq[-2] == seq[-3]:
+            # Repeat penalty - multiple patterns
+            n = len(seq)
+            
+            # 1. Exact token repeat (e.g., AAA)
+            if n >= 4 and seq[-1] == seq[-2] == seq[-3]:
                 logp[i, seq[-1]] -= cfg.REPEAT_LAST_PENALTY
+            
+            # 2. Bi-gram repeat (e.g., AB-AB)
+            if n >= 4:
+                last_bigram = (seq[-2], seq[-1])
+                prev_bigram = (seq[-4], seq[-3])
+                if last_bigram == prev_bigram:
+                    logp[i, seq[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
+                    logp[i, seq[-2]] -= cfg.REPEAT_BIGRAM_PENALTY
+            
+            # 3. Check for AB pattern starting to repeat (A-B-A)
+            if n >= 3 and seq[-1] == seq[-3]:
+                if n >= 4 and seq[-2] == seq[-4]:
+                    logp[i, seq[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
+            
+            # 4. Tri-gram repeat (e.g., ABC-ABC)
+            if n >= 6:
+                last_trigram = (seq[-3], seq[-2], seq[-1])
+                prev_trigram = (seq[-6], seq[-5], seq[-4])
+                if last_trigram == prev_trigram:
+                    logp[i, seq[-1]] -= cfg.REPEAT_TRIGRAM_PENALTY
+                    logp[i, seq[-2]] -= cfg.REPEAT_TRIGRAM_PENALTY
+                    logp[i, seq[-3]] -= cfg.REPEAT_TRIGRAM_PENALTY
             
             logp[i, unk_id] -= cfg.UNK_LOGP_PENALTY
         
