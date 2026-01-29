@@ -1,4 +1,3 @@
-# kiri_ocr/model.py
 """
 KiriOCR Transformer Model.
 
@@ -54,7 +53,7 @@ class CFG:
     # --- Inference Params ---
     CTC_FUSION_ALPHA: float = 0.35
     BEAM: int = 4
-    BEAM_LENP: float = 0.75  # FIXED: was 0.0
+    BEAM_LENP: float = 0.75 
 
     EOS_LOGP_BIAS: float = 0.55
     EOS_LOGP_BOOST: float = 0.65
@@ -601,6 +600,95 @@ def greedy_ctc_decode(
 
     confidence, text, _ = compute_ctc_confidence(ctc_logits, tok)
     return text, confidence
+
+
+@torch.inference_mode()
+def greedy_ctc_decode_streaming(
+    model: KiriOCR,
+    mem: torch.Tensor,
+    tok: CharTokenizer,
+    cfg: CFG,
+) -> Generator[Dict, None, None]:
+    """
+    CTC greedy decoding with frame-by-frame streaming output.
+    
+    Unlike decoder-based streaming, CTC decodes all frames at once but
+    we simulate streaming by yielding characters as they appear during
+    the deduplication process.
+    
+    Args:
+        model: The KiriOCR model
+        mem: Encoder memory [1, T, D] (NOT projected - need raw encoder output)
+        tok: Character tokenizer
+        cfg: Model configuration
+        
+    Yields:
+        Dict with:
+        - 'token': The new character/token string
+        - 'token_id': The CTC token ID
+        - 'text': Full decoded text so far
+        - 'confidence': Frame probability
+        - 'step': Current frame number
+        - 'finished': Whether decoding is complete
+    """
+    # Get CTC logits
+    ctc_logits = model.ctc_head(mem)
+    
+    if ctc_logits.dim() == 3:
+        ctc_logits = ctc_logits.squeeze(0)  # [T, C]
+    
+    probs = F.softmax(ctc_logits, dim=-1)
+    T = ctc_logits.size(0)
+    
+    # Track decoded text and previous token for deduplication
+    decoded_text = ""
+    prev_id = None
+    step = 0
+    
+    # Get all best IDs at once
+    best_ids = ctc_logits.argmax(dim=-1)  # [T]
+    max_probs = probs.max(dim=-1).values  # [T]
+    
+    for t in range(T):
+        idx = best_ids[t].item()
+        conf = max_probs[t].item()
+        
+        # CTC deduplication: skip if same as previous or blank
+        if idx == prev_id:
+            continue
+        
+        prev_id = idx
+        
+        # Skip blank and special tokens
+        if idx < tok.ctc_offset:
+            continue
+            
+        # Decode character
+        raw_id = idx - tok.ctc_offset
+        if 0 <= raw_id < tok.vocab_size:
+            char = tok.id_to_token.get(raw_id, "")
+            if char and char != tok.unk_token:
+                decoded_text += char
+                step += 1
+                
+                yield {
+                    "token": char,
+                    "token_id": idx,
+                    "text": decoded_text,
+                    "confidence": conf,
+                    "step": step,
+                    "finished": False,
+                }
+    
+    # Final yield to signal completion
+    yield {
+        "token": "",
+        "token_id": -1,
+        "text": decoded_text,
+        "confidence": probs.max(dim=-1).values.mean().item(),
+        "step": step,
+        "finished": True,
+    }
 
 
 # ========== STREAMING DECODER (CHARACTER-BY-CHARACTER) ==========

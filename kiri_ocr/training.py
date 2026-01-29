@@ -916,8 +916,22 @@ def save_checkpoint(
             "step": step,
             "best_val_acc": best_val_acc,
             "config": {
+                # Image dimensions
                 "IMG_H": cfg.IMG_H,
                 "IMG_W": cfg.IMG_W,
+                # Encoder architecture
+                "ENC_DIM": cfg.ENC_DIM,
+                "ENC_LAYERS": cfg.ENC_LAYERS,
+                "ENC_HEADS": cfg.ENC_HEADS,
+                "ENC_FF": cfg.ENC_FF,
+                # Decoder architecture
+                "DEC_DIM": cfg.DEC_DIM,
+                "DEC_LAYERS": cfg.DEC_LAYERS,
+                "DEC_HEADS": cfg.DEC_HEADS,
+                "DEC_FF": cfg.DEC_FF,
+                # Regularization
+                "DROPOUT": cfg.DROPOUT,
+                # Training flags
                 "USE_CTC": cfg.USE_CTC,
                 "USE_FP16": cfg.USE_FP16,
             }

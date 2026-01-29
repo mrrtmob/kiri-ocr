@@ -1,4 +1,3 @@
-# kiri_ocr/cli.py
 import json
 import argparse
 import sys

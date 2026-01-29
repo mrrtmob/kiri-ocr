@@ -2,7 +2,6 @@
 DB (Differentiable Binarization) Text Detector.
 
 This module implements text detection using the DB (Differentiable Binarization) method
-via ONNX Runtime with pre-trained PaddleOCR-compatible models.
 """
 import cv2
 import numpy as np
@@ -27,7 +26,6 @@ class DBDetector:
     """
     DB (Differentiable Binarization) text detector using ONNX Runtime.
     
-    Compatible with PaddleOCR detection models converted to ONNX format.
     Supports both CPU and GPU inference via ONNX Runtime.
     
     Example:
@@ -123,7 +121,7 @@ class DBDetector:
             print(f"Model input name: {self.input_name}")
             print(f"Model input shape: {input_shape}")
         
-        # Mean and std for normalization (PaddleOCR default - ImageNet values)
+        # Mean and std for normalization
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 

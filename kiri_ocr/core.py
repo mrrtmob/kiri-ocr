@@ -6,13 +6,17 @@ and recognition into a unified document processing pipeline.
 """
 import json
 import sys
+import warnings
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Tuple, Union
+from typing import Dict, Generator, List, Literal, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image
+
+# Decoding method options
+DecodeMethod = Literal["fast", "accurate", "beam", "ctc", "decoder"]
 
 try:
     from safetensors.torch import load_file
@@ -26,6 +30,7 @@ from .model import (
     KiriOCR,
     beam_decode_one_batched,
     greedy_ctc_decode,
+    greedy_ctc_decode_streaming,
     greedy_decode_streaming,
     beam_decode_streaming,
     preprocess_pil,
@@ -57,7 +62,8 @@ class OCR:
         padding: int = 10,
         device: str = "cpu",
         verbose: bool = False,
-        use_beam_search: bool = True,
+        decode_method: DecodeMethod = "accurate",
+        use_beam_search: Optional[bool] = None,  # Deprecated
         use_fp16: Optional[bool] = None,
     ):
         """
@@ -71,9 +77,29 @@ class OCR:
             padding: Pixels to pad around detected text regions
             device: Compute device - 'cpu' or 'cuda'
             verbose: Enable verbose output during processing
-            use_beam_search: Use beam search decoding (slower but more accurate)
+            decode_method: Text recognition decoding method:
+                - 'fast' or 'ctc': Fast CTC decoding (no decoder, lower quality)
+                - 'accurate' or 'decoder': Autoregressive decoder (better quality)
+                - 'beam': Beam search decoder (best quality, slowest)
+            use_beam_search: DEPRECATED - Use decode_method instead.
+                            True maps to 'beam', False maps to 'fast'
             use_fp16: Force FP16 inference (None=auto, True/False=forced)
         """
+        # Handle deprecated use_beam_search parameter
+        if use_beam_search is not None:
+            warnings.warn(
+                "use_beam_search is deprecated. Use decode_method instead:\n"
+                "  - decode_method='fast' (replaces use_beam_search=False)\n"
+                "  - decode_method='accurate' (default, balanced)\n"
+                "  - decode_method='beam' (replaces use_beam_search=True)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            decode_method = "beam" if use_beam_search else "fast"
+        
+        # Normalize decode_method aliases
+        decode_method = self._normalize_decode_method(decode_method)
+        
         # Store configuration
         self.device = device
         self.verbose = verbose
@@ -81,17 +107,27 @@ class OCR:
         self.det_model_path = det_model_path
         self.det_method = det_method
         self.det_conf_threshold = det_conf_threshold
-        self.use_beam_search = use_beam_search
+        self.decode_method = decode_method
         self.use_fp16 = use_fp16
+        
+        # Keep use_beam_search for backward compatibility (derived from decode_method)
+        self.use_beam_search = decode_method == "beam"
 
         # Model components (initialized in _load_model)
         self.cfg: Optional[CFG] = None
         self.tokenizer: Optional[CharTokenizer] = None
         self.model: Optional[KiriOCR] = None
 
-        # Store repo_id for detector lazy loading
+        # Store repo_id for detector lazy loading (only for HuggingFace repos)
         self.repo_id: Optional[str] = None
-        if "/" in model_path and not model_path.startswith((".", "/")):
+        # A HuggingFace repo ID: contains "/" but is NOT a file path
+        # File paths: start with ".", "/" or contain file extensions like ".safetensors", ".pt"
+        is_likely_hf_repo = (
+            "/" in model_path
+            and not model_path.startswith((".", "/"))
+            and not model_path.endswith((".safetensors", ".pt", ".onnx", ".pth"))
+        )
+        if is_likely_hf_repo:
             self.repo_id = model_path
 
         # Resolve and load model
@@ -100,6 +136,24 @@ class OCR:
 
         # Lazy-loaded detector
         self._detector = None
+
+    @staticmethod
+    def _normalize_decode_method(method: str) -> str:
+        """Normalize decode method aliases to canonical names."""
+        method = method.lower().strip()
+        aliases = {
+            "fast": "ctc",
+            "ctc": "ctc",
+            "accurate": "decoder",
+            "decoder": "decoder",
+            "beam": "beam",
+        }
+        if method not in aliases:
+            raise ValueError(
+                f"Invalid decode_method '{method}'. "
+                f"Choose from: 'fast', 'accurate', 'beam' (or aliases: 'ctc', 'decoder')"
+            )
+        return aliases[method]
 
     # ==================== Model Loading ====================
 
@@ -238,8 +292,99 @@ class OCR:
                 metadata = json.load(f)
             vocab_path = metadata.get("vocab_path", "")
             self._apply_config(metadata.get("config", {}))
+        else:
+            # Fallback: infer architecture from state_dict
+            if self.verbose:
+                print("  ⚠️ No metadata file found, inferring architecture from weights...")
+            self._infer_config_from_state_dict(state_dict)
         
         return state_dict, vocab_path
+    
+    def _infer_config_from_state_dict(self, state_dict: Dict) -> None:
+        """
+        Infer model architecture from state_dict keys and shapes.
+        
+        This is a fallback for legacy models without metadata.
+        """
+        # Infer ENC_DIM from stem output channel (stem.net.9.weight is [enc_dim, 160, 3, 3])
+        if "stem.net.9.weight" in state_dict:
+            self.cfg.ENC_DIM = state_dict["stem.net.9.weight"].shape[0]
+            if self.verbose:
+                print(f"    Inferred ENC_DIM={self.cfg.ENC_DIM}")
+        
+        # Count encoder layers (enc.layers.0, enc.layers.1, ...)
+        enc_layers = set()
+        for key in state_dict.keys():
+            if key.startswith("enc.layers."):
+                layer_num = int(key.split(".")[2])
+                enc_layers.add(layer_num)
+        if enc_layers:
+            self.cfg.ENC_LAYERS = max(enc_layers) + 1
+            if self.verbose:
+                print(f"    Inferred ENC_LAYERS={self.cfg.ENC_LAYERS}")
+        
+        # Count decoder layers (dec.layers.0, dec.layers.1, ...)
+        dec_layers = set()
+        for key in state_dict.keys():
+            if key.startswith("dec.layers."):
+                layer_num = int(key.split(".")[2])
+                dec_layers.add(layer_num)
+        if dec_layers:
+            self.cfg.DEC_LAYERS = max(dec_layers) + 1
+            if self.verbose:
+                print(f"    Inferred DEC_LAYERS={self.cfg.DEC_LAYERS}")
+        
+        # Infer ENC_FF from encoder FFN weight shape
+        for key in state_dict.keys():
+            if "enc.layers.0.linear1.weight" in key:
+                self.cfg.ENC_FF = state_dict[key].shape[0]
+                if self.verbose:
+                    print(f"    Inferred ENC_FF={self.cfg.ENC_FF}")
+                break
+        
+        # Infer DEC_DIM from decoder embedding
+        if "dec_emb.weight" in state_dict:
+            self.cfg.DEC_DIM = state_dict["dec_emb.weight"].shape[1]
+            if self.verbose:
+                print(f"    Inferred DEC_DIM={self.cfg.DEC_DIM}")
+        
+        # Infer DEC_FF from decoder FFN weight shape
+        for key in state_dict.keys():
+            if "dec.layers.0.linear1.weight" in key:
+                self.cfg.DEC_FF = state_dict[key].shape[0]
+                if self.verbose:
+                    print(f"    Inferred DEC_FF={self.cfg.DEC_FF}")
+                break
+        
+        # Infer ENC_HEADS from attention in_proj_weight (shape is [3*dim, dim])
+        # num_heads = dim / head_dim, typically head_dim=64
+        for key in state_dict.keys():
+            if "enc.layers.0.self_attn.in_proj_weight" in key:
+                total_dim = state_dict[key].shape[0] // 3
+                # Assume head_dim is 64 (common default)
+                if total_dim % 64 == 0:
+                    self.cfg.ENC_HEADS = total_dim // 64
+                elif total_dim % 32 == 0:
+                    self.cfg.ENC_HEADS = total_dim // 32
+                else:
+                    self.cfg.ENC_HEADS = 8  # fallback default
+                if self.verbose:
+                    print(f"    Inferred ENC_HEADS={self.cfg.ENC_HEADS}")
+                break
+        
+        # Infer DEC_HEADS similarly
+        for key in state_dict.keys():
+            if "dec.layers.0.self_attn.in_proj_weight" in key:
+                total_dim = state_dict[key].shape[0] // 3
+                if total_dim % 64 == 0:
+                    self.cfg.DEC_HEADS = total_dim // 64
+                elif total_dim % 32 == 0:
+                    self.cfg.DEC_HEADS = total_dim // 32
+                else:
+                    self.cfg.DEC_HEADS = 8  # fallback default
+                if self.verbose:
+                    print(f"    Inferred DEC_HEADS={self.cfg.DEC_HEADS}")
+                break
 
     def _load_torch_checkpoint(self, model_path: str) -> Tuple[Dict, str]:
         """Load model from PyTorch checkpoint."""
@@ -265,8 +410,26 @@ class OCR:
         """Apply configuration dict to CFG object."""
         if not config_data:
             return
+        # Image dimensions
         self.cfg.IMG_H = config_data.get("IMG_H", self.cfg.IMG_H)
         self.cfg.IMG_W = config_data.get("IMG_W", self.cfg.IMG_W)
+        
+        # Encoder architecture
+        self.cfg.ENC_DIM = config_data.get("ENC_DIM", self.cfg.ENC_DIM)
+        self.cfg.ENC_LAYERS = config_data.get("ENC_LAYERS", self.cfg.ENC_LAYERS)
+        self.cfg.ENC_HEADS = config_data.get("ENC_HEADS", self.cfg.ENC_HEADS)
+        self.cfg.ENC_FF = config_data.get("ENC_FF", self.cfg.ENC_FF)
+        
+        # Decoder architecture
+        self.cfg.DEC_DIM = config_data.get("DEC_DIM", self.cfg.DEC_DIM)
+        self.cfg.DEC_LAYERS = config_data.get("DEC_LAYERS", self.cfg.DEC_LAYERS)
+        self.cfg.DEC_HEADS = config_data.get("DEC_HEADS", self.cfg.DEC_HEADS)
+        self.cfg.DEC_FF = config_data.get("DEC_FF", self.cfg.DEC_FF)
+        
+        # Regularization
+        self.cfg.DROPOUT = config_data.get("DROPOUT", self.cfg.DROPOUT)
+        
+        # Training flags
         self.cfg.USE_CTC = config_data.get("USE_CTC", self.cfg.USE_CTC)
         self.cfg.USE_FP16 = config_data.get("USE_FP16", self.cfg.USE_FP16)
 
@@ -372,14 +535,26 @@ class OCR:
         if self.cfg.USE_CTC and hasattr(self.model, "ctc_head"):
             ctc_logits = self.model.ctc_head(mem)
 
-        # Decode
-        if self.use_beam_search:
+        # Decode based on method
+        if self.decode_method == "ctc":
+            # Fast CTC decoding (no decoder)
+            text, confidence = greedy_ctc_decode(
+                self.model, image_tensor, self.tokenizer, self.cfg
+            )
+        elif self.decode_method == "decoder":
+            # Greedy decoder (balanced speed/quality)
+            # Use beam search with beam=1 for greedy decoding
+            from .model import beam_decode_one_batched
+            old_beam = self.cfg.BEAM
+            self.cfg.BEAM = 1
             text, confidence = beam_decode_one_batched(
                 self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
             )
-        else:
-            text, confidence = greedy_ctc_decode(
-                self.model, image_tensor, self.tokenizer, self.cfg
+            self.cfg.BEAM = old_beam
+        else:  # beam
+            # Full beam search (best quality)
+            text, confidence = beam_decode_one_batched(
+                self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
             )
 
         return text, confidence
@@ -387,7 +562,7 @@ class OCR:
     def recognize_region_streaming(
         self,
         image_tensor: torch.Tensor,
-        use_beam_search: bool = False,
+        decode_method: Optional[str] = None,
     ) -> Generator[Dict, None, None]:
         """
         Recognize text with character-by-character streaming, like LLM generation.
@@ -396,7 +571,11 @@ class OCR:
         
         Args:
             image_tensor: Preprocessed image tensor from preprocess_pil()
-            use_beam_search: Use beam search (slower but higher quality)
+            decode_method: Decoding method override. Options:
+                - 'fast' or 'ctc': Fast CTC decoding
+                - 'accurate' or 'decoder': Greedy decoder
+                - 'beam': Beam search decoder
+                - None: Use instance setting (self.decode_method)
             
         Yields:
             Dict with:
@@ -427,20 +606,34 @@ class OCR:
         if self.cfg.USE_CTC and hasattr(self.model, "ctc_head"):
             ctc_logits = self.model.ctc_head(mem)
 
-        # Stream decode
-        if use_beam_search:
-            yield from beam_decode_streaming(
+        # Use instance setting if not explicitly specified
+        method = decode_method
+        if method is not None:
+            method = self._normalize_decode_method(method)
+        else:
+            method = self.decode_method
+
+        # Stream decode based on method
+        if method == "ctc":
+            # CTC streaming (fast, no decoder)
+            yield from greedy_ctc_decode_streaming(
+                self.model, mem, self.tokenizer, self.cfg
+            )
+        elif method == "decoder":
+            # Greedy decoder streaming
+            yield from greedy_decode_streaming(
                 self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
             )
-        else:
-            yield from greedy_decode_streaming(
+        else:  # beam
+            # Beam search streaming
+            yield from beam_decode_streaming(
                 self.model, mem_proj, self.tokenizer, self.cfg, ctc_logits_1=ctc_logits
             )
 
     def recognize_streaming(
         self,
         image_path: Union[str, Path],
-        use_beam_search: bool = False,
+        decode_method: Optional[str] = None,
     ) -> Generator[Dict, None, None]:
         """
         Recognize text from a single-line image with character streaming.
@@ -449,7 +642,8 @@ class OCR:
         
         Args:
             image_path: Path to the single-line text image
-            use_beam_search: Use beam search for better quality
+            decode_method: Decoding method override ('fast', 'accurate', 'beam').
+                          None = use instance setting
             
         Yields:
             Dict with token, text, confidence, step, finished
@@ -473,7 +667,7 @@ class OCR:
         img_pil = Image.fromarray(img)
         img_tensor = preprocess_pil(self.cfg, img_pil)
 
-        yield from self.recognize_region_streaming(img_tensor, use_beam_search)
+        yield from self.recognize_region_streaming(img_tensor, decode_method)
 
     def recognize_single_line_image(
         self, 
@@ -679,7 +873,7 @@ class OCR:
         self,
         image_path: Union[str, Path],
         mode: str = "lines",
-        use_beam_search: bool = False,
+        decode_method: Optional[str] = None,
         verbose: bool = False,
     ) -> Generator[Dict, None, None]:
         """
@@ -691,7 +885,8 @@ class OCR:
         Args:
             image_path: Path to the document image
             mode: Detection mode - 'lines' or 'words'
-            use_beam_search: Use beam search for better quality (slower)
+            decode_method: Decoding method override ('fast', 'accurate', 'beam').
+                          None = use instance setting (self.decode_method)
             verbose: Enable verbose output
 
         Yields:
@@ -767,7 +962,7 @@ class OCR:
                 current_region_text = ""
                 
                 # Stream characters for this region
-                for chunk in self.recognize_region_streaming(region_tensor, use_beam_search):
+                for chunk in self.recognize_region_streaming(region_tensor, decode_method):
                     current_region_text = chunk["text"]
                     
                     # Build cumulative text
