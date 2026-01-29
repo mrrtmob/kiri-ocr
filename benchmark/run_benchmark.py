@@ -48,7 +48,7 @@ def main():
         if not os.path.exists(model_path):
              print(f"Warning: {model_path} not found.")
         
-        ocr = OCR(device=device, model_path=model_path)
+        ocr = OCR(device=device,decode_method='fast')
     except Exception as e:
         print(f"Failed to load model: {e}")
         sys.exit(1)
