@@ -7,7 +7,7 @@ Main Components:
 - TextDetector: Text detection module
 """
 
-__version__ = '0.2.11'
+__version__ = '0.2.12'
 
 # Lazy imports for fast CLI startup
 # Heavy modules (torch, cv2) are only loaded when actually used
