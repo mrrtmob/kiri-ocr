@@ -145,6 +145,34 @@ class CharTokenizer:
 
 
 # ========== MODEL COMPONENTS ==========
+class SinusoidalPosEnc1D(nn.Module):
+    """Sinusoidal positional encoding for 1D sequences (decoder)"""
+    def __init__(self, dim: int, max_len: int = 2048, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Create positional encoding buffer
+        pe = torch.zeros(max_len, dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, dim]
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, seq_len, dim]
+        Returns:
+            x + positional encoding
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
 class PosEnc2D(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -240,6 +268,12 @@ class KiriOCR(nn.Module):
 
         self.mem_proj = nn.Linear(cfg.ENC_DIM, cfg.DEC_DIM, bias=False)
         self.dec_emb = nn.Embedding(tok.dec_vocab, cfg.DEC_DIM)
+        # *** CRITICAL: Add positional encoding for decoder ***
+        self.dec_pos_enc = SinusoidalPosEnc1D(
+            dim=cfg.DEC_DIM,
+            max_len=cfg.MAX_DEC_LEN + 10,
+            dropout=d
+        )
 
         dec_layer = nn.TransformerDecoderLayer(
             d_model=cfg.DEC_DIM,
@@ -417,6 +451,7 @@ def beam_decode_one_batched(
             inp[i, : len(seq)] = torch.tensor(seq, device=device, dtype=torch.long)
 
         tgt = model.dec_emb(inp)
+        tgt = model.dec_pos_enc(tgt)  # Apply positional encoding
         causal = full_causal[:maxL, :maxL]
 
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
@@ -791,6 +826,7 @@ def greedy_decode_streaming(
         inp = torch.tensor([generated_ids], device=device, dtype=torch.long)
         
         tgt = model.dec_emb(inp)
+        tgt = model.dec_pos_enc(tgt)  # Apply positional encoding
         causal = full_causal[:seq_len, :seq_len]
         
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
@@ -971,6 +1007,7 @@ def beam_decode_streaming(
             inp[i, : len(seq)] = torch.tensor(seq, device=device, dtype=torch.long)
         
         tgt = model.dec_emb(inp)
+        tgt = model.dec_pos_enc(tgt)  # Apply positional encoding
         causal = full_causal[:maxL, :maxL]
         
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):

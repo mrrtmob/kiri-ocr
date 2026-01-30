@@ -254,7 +254,17 @@ class OCR:
             # Initialize model
             self.tokenizer = CharTokenizer(vocab_path, self.cfg)
             self.model = KiriOCR(self.cfg, self.tokenizer).to(self.device)
-            self.model.load_state_dict(state_dict, strict=True)
+            
+            # Load state dict with strict=False for backward compatibility
+            # Old models may not have dec_pos_enc (added for better decoder quality)
+            missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+            
+            # Warn if decoder positional encoding is missing (old model)
+            if any("dec_pos_enc" in k for k in missing_keys):
+                if self.verbose:
+                    print("  ⚠️ Model trained without decoder positional encoding")
+                    print("    Decoder quality may be poor. Consider retraining with new architecture.")
+            
             self.model.eval()
 
             # Enable FP16 on CUDA
