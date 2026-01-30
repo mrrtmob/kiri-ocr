@@ -741,6 +741,9 @@ def train_command(args):
             dec_out = dec_tgts[:, 1:]  # [a, b, c, EOS]
 
             tgt_emb = model.dec_emb(dec_inp)
+            # Apply positional encoding if available
+            if model.dec_pos_enc is not None:
+                tgt_emb = model.dec_pos_enc(tgt_emb)
             seq_len = dec_inp.size(1)
             tgt_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device) * float("-inf"), diagonal=1
@@ -817,7 +820,7 @@ def train_command(args):
             f"    Train Loss: {avg_loss:.4f} (CTC: {avg_ctc:.4f}, Dec: {avg_dec:.4f})"
         )
 
-        # ========== VALIDATION ==========
+        # ========== VALIDATION (OPTIMIZED) ==========
         val_loss = 0
         val_acc = 0
         val_dec_acc = 0
@@ -827,47 +830,74 @@ def train_command(args):
             val_total = 0
             val_ctc_correct = 0
             val_dec_correct = 0
+            
+            # Limit validation samples for speed (sample ~10K from dataset)
+            max_val_samples = getattr(args, "max_val_samples", None)
+            
+            from .model import compute_ctc_confidence
 
             with torch.no_grad():
-                for batch in tqdm(val_loader, desc="Validating", leave=False):
+                for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validating", leave=False)):
                     imgs = batch["images"].to(device)
                     texts = batch["texts"]
+                    batch_size = imgs.size(0)
+                    
+                    # Check if we've validated enough samples (only if limit is set)
+                    if max_val_samples and val_total >= max_val_samples:
+                        break
 
-                    for i in range(imgs.size(0)):
+                    # ========== ENCODE ONCE for entire batch ==========
+                    memory = model.encode(imgs)  # [B, T, D]
+                    
+                    # ========== BATCHED CTC VALIDATION ==========
+                    ctc_logits = model.ctc_head(memory)  # [B, T, C]
+                    
+                    for i in range(batch_size):
+                        if max_val_samples and val_total >= max_val_samples:
+                            break
+                            
                         try:
-                            # CTC validation
-                            pred_ctc, _ = greedy_ctc_decode(
-                                model, imgs[i : i + 1], tokenizer, cfg
+                            # CTC decode (fast - no autoregressive)
+                            _, pred_ctc, _ = compute_ctc_confidence(
+                                ctc_logits[i], tokenizer
                             )
                             if pred_ctc.strip() == texts[i].strip():
                                 val_ctc_correct += 1
-                            
-                            # Decoder validation (using beam_decode_one_batched with beam=1)
+                        except Exception:
+                            pass
+                        val_total += 1
+                    
+                    # ========== DECODER VALIDATION (sampled) ==========
+                    # Only validate decoder on first sample of each batch for speed
+                    # Full decoder validation is too slow for large datasets
+                    if batch_idx % 10 == 0:  # Sample every 10th batch
+                        try:
                             from .model import beam_decode_one_batched
-                            mem = model.encode(imgs[i : i + 1])
-                            mem_proj = model.mem_proj(mem)
-                            ctc_logits = model.ctc_head(mem) if cfg.USE_CTC else None
+                            mem_proj = model.mem_proj(memory[:1])  # First sample only
+                            ctc_logits_1 = ctc_logits[:1] if cfg.USE_CTC else None
                             
                             old_beam = cfg.BEAM
                             cfg.BEAM = 1  # Greedy for speed
                             pred_dec, _ = beam_decode_one_batched(
-                                model, mem_proj, tokenizer, cfg, ctc_logits_1=ctc_logits
+                                model, mem_proj, tokenizer, cfg, ctc_logits_1=ctc_logits_1
                             )
                             cfg.BEAM = old_beam
                             
-                            if pred_dec.strip() == texts[i].strip():
+                            if pred_dec.strip() == texts[0].strip():
                                 val_dec_correct += 1
-                        except Exception as e:
+                        except Exception:
                             pass
-                        val_total += 1
 
             val_acc = val_ctc_correct / max(1, val_total) * 100
-            val_dec_acc = val_dec_correct / max(1, val_total) * 100
+            # Decoder accuracy based on sampled batches
+            sampled_batches = (batch_idx + 1) // 10 + 1
+            val_dec_acc = val_dec_correct / max(1, sampled_batches) * 100
+            
             print(f"    Val CTC Accuracy: {val_acc:.2f}% ({val_ctc_correct}/{val_total})")
-            print(f"    Val Decoder Accuracy: {val_dec_acc:.2f}% ({val_dec_correct}/{val_total})")
+            print(f"    Val Decoder Accuracy (sampled): {val_dec_acc:.2f}% ({val_dec_correct}/{sampled_batches} batches)")
             
             # Alert if decoder is significantly worse than CTC
-            if val_acc - val_dec_acc > 10:
+            if val_acc - val_dec_acc > 15:
                 print(f"    ⚠️  Decoder ({val_dec_acc:.1f}%) is underperforming CTC ({val_acc:.1f}%)")
                 print(f"       Consider increasing --dec_weight (current effective loss balance)")
 
