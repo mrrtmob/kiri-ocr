@@ -251,19 +251,25 @@ class OCR:
                     f"Could not find vocabulary file. Expected near: {model_path}"
                 )
 
-            # Initialize model
+            # Check if model has decoder positional encoding (new architecture)
+            has_dec_pos_enc = any("dec_pos_enc" in k for k in state_dict.keys())
+            
+            # Initialize model (disable pos enc for old models to avoid random weights)
             self.tokenizer = CharTokenizer(vocab_path, self.cfg)
-            self.model = KiriOCR(self.cfg, self.tokenizer).to(self.device)
+            self.model = KiriOCR(
+                self.cfg,
+                self.tokenizer,
+                use_dec_pos_enc=has_dec_pos_enc
+            ).to(self.device)
             
             # Load state dict with strict=False for backward compatibility
-            # Old models may not have dec_pos_enc (added for better decoder quality)
             missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
             
             # Warn if decoder positional encoding is missing (old model)
-            if any("dec_pos_enc" in k for k in missing_keys):
+            if not has_dec_pos_enc:
                 if self.verbose:
-                    print("  ⚠️ Model trained without decoder positional encoding")
-                    print("    Decoder quality may be poor. Consider retraining with new architecture.")
+                    print("  ⚠️ Old model without decoder positional encoding")
+                    print("    Decoder quality may be limited. Consider retraining with new architecture.")
             
             self.model.eval()
 

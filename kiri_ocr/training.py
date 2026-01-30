@@ -741,7 +741,9 @@ def train_command(args):
             dec_out = dec_tgts[:, 1:]  # [a, b, c, EOS]
 
             tgt_emb = model.dec_emb(dec_inp)
-            tgt_emb = model.dec_pos_enc(tgt_emb)  # Apply positional encoding
+            # Apply positional encoding if available
+            if model.dec_pos_enc is not None:
+                tgt_emb = model.dec_pos_enc(tgt_emb)
             seq_len = dec_inp.size(1)
             tgt_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device) * float("-inf"), diagonal=1
@@ -830,7 +832,7 @@ def train_command(args):
             val_dec_correct = 0
             
             # Limit validation samples for speed (sample ~10K from dataset)
-            max_val_samples = getattr(args, "max_val_samples", 10000)
+            max_val_samples = getattr(args, "max_val_samples", None)
             
             from .model import compute_ctc_confidence
 
@@ -840,8 +842,8 @@ def train_command(args):
                     texts = batch["texts"]
                     batch_size = imgs.size(0)
                     
-                    # Check if we've validated enough samples
-                    if val_total >= max_val_samples:
+                    # Check if we've validated enough samples (only if limit is set)
+                    if max_val_samples and val_total >= max_val_samples:
                         break
 
                     # ========== ENCODE ONCE for entire batch ==========
@@ -851,7 +853,7 @@ def train_command(args):
                     ctc_logits = model.ctc_head(memory)  # [B, T, C]
                     
                     for i in range(batch_size):
-                        if val_total >= max_val_samples:
+                        if max_val_samples and val_total >= max_val_samples:
                             break
                             
                         try:
