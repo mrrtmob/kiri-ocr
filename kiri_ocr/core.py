@@ -560,7 +560,6 @@ class OCR:
         elif self.decode_method == "decoder":
             # Greedy decoder (balanced speed/quality)
             # Use beam search with beam=1 for greedy decoding
-            from .model import beam_decode_one_batched
             old_beam = self.cfg.BEAM
             self.cfg.BEAM = 1
             text, confidence = beam_decode_one_batched(

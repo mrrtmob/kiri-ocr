@@ -51,22 +51,22 @@ class CFG:
     USE_AUTOCAST: bool = True
 
     # --- Inference Params ---
-    CTC_FUSION_ALPHA: float = 0.35
-    BEAM: int = 4
-    BEAM_LENP: float = 0.75
+    CTC_FUSION_ALPHA: float = 0.5
+    BEAM: int = 3
+    BEAM_LENP: float = 0.8
 
-    EOS_LOGP_BIAS: float = 0.55
-    EOS_LOGP_BOOST: float = 0.65
-    EOS_BIAS_UNTIL_LEN: int = 28
+    EOS_LOGP_BIAS: float = 0.0
+    EOS_LOGP_BOOST: float = 0.0
+    EOS_BIAS_UNTIL_LEN: int = 2
 
-    REPEAT_LAST_PENALTY: float = 2.0      # Penalty for exact token repeat
-    REPEAT_BIGRAM_PENALTY: float = 1.5    # Penalty for bi-gram repeat (e.g. AB-AB)
-    REPEAT_TRIGRAM_PENALTY: float = 1.2   # Penalty for tri-gram repeat
-    UNK_LOGP_PENALTY: float = 1.0
+    REPEAT_LAST_PENALTY: float = 3   # Penalty for exact token repeat
+    REPEAT_BIGRAM_PENALTY: float = 2.5      # Penalty for bi-gram repeat (e.g. AB-AB)
+    REPEAT_TRIGRAM_PENALTY: float = 2.0   # Penalty for tri-gram repeat
+    UNK_LOGP_PENALTY: float = 10
 
-    DEC_MAX_LEN_RATIO: float = 1.35
-    DEC_MAX_LEN_PAD: int = 6
-    MEM_MAX_LEN_RATIO: float = 0.75
+    DEC_MAX_LEN_RATIO: float = 1.3
+    DEC_MAX_LEN_PAD: int = 10
+    MEM_MAX_LEN_RATIO: float = 1
 
 
 # ========== RESULT TYPE ==========
@@ -397,6 +397,7 @@ def beam_decode_one_batched(
 ) -> Tuple[str, float]:
     """
     Beam search decoder with confidence score.
+    Handles both legacy models (no pos enc) and new models (with pos enc).
 
     Returns:
         (decoded_text, confidence_score)
@@ -404,14 +405,14 @@ def beam_decode_one_batched(
     device = mem_proj_1.device
     is_cuda = device.type == "cuda"
 
-    # Get CTC info for length estimation and fusion
+    # 1. Get CTC info for length estimation and fusion
     ctc_confidence = None
     target_len = None
 
     if ctc_logits_1 is not None:
         ctc_confidence, ctc_text, target_len = compute_ctc_confidence(ctc_logits_1, tok)
 
-    # Calculate max decoding steps
+    # 2. Calculate max decoding steps based on CTC estimate or memory length
     if target_len and target_len > 0:
         max_steps = min(
             cfg.MAX_DEC_LEN,
@@ -423,11 +424,12 @@ def beam_decode_one_batched(
             cfg.MAX_DEC_LEN, int(mem_len * cfg.MEM_MAX_LEN_RATIO) + cfg.DEC_MAX_LEN_PAD
         )
 
-    # Beam state: (score, token_ids, token_logprobs, finished)
+    # 3. Beam state: (score, token_ids, token_logprobs, finished)
     beams: List[Tuple[float, List[int], List[float], bool]] = [
         (0.0, [tok.dec_bos], [], False)
     ]
 
+    # Pre-compute causal mask
     full_causal = torch.triu(
         torch.ones(
             (cfg.MAX_DEC_LEN + 2, cfg.MAX_DEC_LEN + 2), device=device, dtype=torch.bool
@@ -437,13 +439,16 @@ def beam_decode_one_batched(
 
     use_amp = cfg.USE_AUTOCAST and is_cuda
 
+    # 4. Main Decoding Loop
     for step in range(max_steps):
+        # Stop if all beams are finished
         if all(b[3] for b in beams):
             break
 
         alive = [b for b in beams if not b[3]]
         done = [b for b in beams if b[3]]
 
+        # If all beams died (shouldn't happen usually), revert to done
         if not alive:
             beams = done
             break
@@ -451,14 +456,19 @@ def beam_decode_one_batched(
         maxL = max(len(b[1]) for b in alive)
         B = len(alive)
 
+        # Prepare batch input for the Transformer
         inp = torch.full((B, maxL), tok.dec_pad, device=device, dtype=torch.long)
         for i, (_, seq, _, _) in enumerate(alive):
             inp[i, : len(seq)] = torch.tensor(seq, device=device, dtype=torch.long)
 
+        # === MODEL FORWARD PASS ===
         tgt = model.dec_emb(inp)
-        # Apply positional encoding if available (old models don't have it)
-        if model.dec_pos_enc is not None:
+        
+        # [FIX]: Check if positional encoding exists before applying it.
+        # This makes it compatible with both old weights (None) and new weights.
+        if getattr(model, "dec_pos_enc", None) is not None:
             tgt = model.dec_pos_enc(tgt)
+            
         causal = full_causal[:maxL, :maxL]
 
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
@@ -469,17 +479,18 @@ def beam_decode_one_batched(
             logits = model.dec_head(out)[:, -1, :]
             logp = F.log_softmax(logits, dim=-1)
 
+            # Optional: Language Model Fusion
             if cfg.USE_LM and cfg.USE_LM_FUSION_EVAL and hasattr(model, "lm_head"):
                 lm_logits = model.lm_head(out)[:, -1, :]
                 logp = logp + cfg.LM_FUSION_ALPHA * F.log_softmax(lm_logits, dim=-1)
 
-        # Apply penalties
+        # === PENALTIES ===
         unk_id = tok.unk_id + tok.dec_offset
 
         for i, (_, seq, _, _) in enumerate(alive):
             cur_len = len(seq) - 1
 
-            # EOS bias based on target length
+            # A. EOS Bias (encourage finishing around target_len)
             if target_len and target_len > 0:
                 min_len = min(cfg.EOS_BIAS_UNTIL_LEN, max(1, int(target_len * 0.5)))
                 if cur_len < min_len:
@@ -490,10 +501,10 @@ def beam_decode_one_batched(
                 if cur_len < cfg.EOS_BIAS_UNTIL_LEN:
                     logp[i, tok.dec_eos] -= cfg.EOS_LOGP_BIAS
 
-            # Repeat penalty - multiple patterns
+            # B. Advanced Repeat Penalties
             n = len(seq)
             
-            # 1. Exact token repeat (e.g., AAA)
+            # 1. Exact token repeat (e.g., A-A-A)
             if n >= 4 and seq[-1] == seq[-2] == seq[-3]:
                 logp[i, seq[-1]] -= cfg.REPEAT_LAST_PENALTY
             
@@ -505,7 +516,7 @@ def beam_decode_one_batched(
                     logp[i, seq[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
                     logp[i, seq[-2]] -= cfg.REPEAT_BIGRAM_PENALTY
             
-            # 3. Check for AB pattern starting to repeat (A-B-A)
+            # 3. Interrupted repeat (A-B-A) check
             if n >= 3 and seq[-1] == seq[-3]:
                 if n >= 4 and seq[-2] == seq[-4]:
                     logp[i, seq[-1]] -= cfg.REPEAT_BIGRAM_PENALTY
@@ -519,12 +530,12 @@ def beam_decode_one_batched(
                     logp[i, seq[-2]] -= cfg.REPEAT_TRIGRAM_PENALTY
                     logp[i, seq[-3]] -= cfg.REPEAT_TRIGRAM_PENALTY
 
-            # UNK penalty
+            # C. UNK Penalty
             logp[i, unk_id] -= cfg.UNK_LOGP_PENALTY
 
+        # 5. Expand Beams
         topv, topi = torch.topk(logp, k=cfg.BEAM, dim=-1)
 
-        # Expand beams
         new_beams: List[Tuple[float, List[int], List[float], bool]] = list(done)
 
         for bi, (base_score, seq, logprobs, _) in enumerate(alive):
@@ -535,11 +546,14 @@ def beam_decode_one_batched(
                 new_score = base_score + float(v)
                 new_beams.append((new_score, new_seq, new_logprobs, is_finished))
 
-        # Length-normalized scoring
+        # 6. Length-normalized scoring for pruning
         def normed(entry):
             score, seq, _, _ = entry
             L = max(1, len(seq) - 1)
-            return score / (L**cfg.BEAM_LENP)
+            # Standard Length Normalization
+            # prevents short/long bias issues with negative numbers
+            penalty = ((5 + L) ** cfg.BEAM_LENP) / ((5 + 1) ** cfg.BEAM_LENP)
+            return score / penalty
 
         new_beams.sort(key=normed, reverse=True)
         beams = new_beams[: cfg.BEAM]
@@ -548,8 +562,9 @@ def beam_decode_one_batched(
     def final_score_and_confidence(entry):
         score, seq, logprobs, _ = entry
         length = max(1, len(seq) - 1)
-
-        dec_score = score / (length**cfg.BEAM_LENP)
+        denom = length**cfg.BEAM_LENP if length > 0 else 1.0
+        
+        dec_score = score / denom
         dec_conf = compute_sequence_confidence(logprobs)
 
         # CTC fusion
@@ -577,7 +592,7 @@ def beam_decode_one_batched(
     # ========== COMPUTE FINAL CONFIDENCE ==========
     # Combine decoder confidence with CTC confidence (if available)
     if ctc_confidence is not None:
-        # Weighted average: favor decoder slightly
+        # Weighted average: favor decoder slightly (0.6 / 0.4 split)
         final_confidence = 0.6 * best_dec_conf + 0.4 * ctc_confidence
     else:
         final_confidence = best_dec_conf
