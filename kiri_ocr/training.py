@@ -17,6 +17,7 @@ import numpy as np
 import json
 import math
 import itertools
+import random 
 
 try:
     from datasets import load_dataset, concatenate_datasets
@@ -102,8 +103,6 @@ def build_vocab_from_dataset(labels_file, output_path):
 
 # ========== DATASET WITH BOTH CTC AND DECODER TARGETS ==========
 class HFTransformerDataset(Dataset):
-    """Dataset that returns both CTC and decoder targets"""
-
     def __init__(
         self,
         dataset,
@@ -112,52 +111,79 @@ class HFTransformerDataset(Dataset):
         img_width=640,
         image_col="image",
         text_col="text",
+        augment=False,  # <--- Flag to control augmentation
     ):
         if load_dataset is None:
             raise ImportError("Please install 'datasets' library")
-
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.img_height = img_height
         self.img_width = img_width
         self.image_col = image_col
         self.text_col = text_col
+        self.augment = augment
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        item = self.dataset[idx]
-        img = item[self.image_col]
-        text = item[self.text_col]
-
         try:
-            # Image preprocessing
+            item = self.dataset[idx]
+            img = item[self.image_col]
+            text = item[self.text_col]
+            
+            # Ensure image is Grayscale
             if img.mode != "L":
                 img = img.convert("L")
-
+            
             w, h = img.size
+
+            # =========================================================
+            # 1. WIDTH AUGMENTATION (The Fix for Stuttering)
+            # =========================================================
+            if self.augment:
+                # Randomly stretch or shrink width by +/- 25%
+                width_scale = random.uniform(0.75, 1.25)
+                
+                # Apply scaling
+                new_w_temp = int(w * width_scale)
+                # Resize keeping height same for now
+                img = img.resize((new_w_temp, h), Image.BILINEAR)
+                
+                # Update w for the next calculation
+                w = new_w_temp
+
+            # =========================================================
+            # 2. STANDARD PREPROCESSING (Resize & Pad)
+            # =========================================================
+            
+            # Calculate new width to match target height (maintaining aspect ratio)
             new_w = int(w * self.img_height / h)
             img = img.resize((new_w, self.img_height), Image.BILINEAR)
-
+            
+            # Create canvas (Gray background 128)
             final_img = Image.new("L", (self.img_width, self.img_height), 128)
             paste_w = min(new_w, self.img_width)
+            
+            # Paste image (Left aligned)
             final_img.paste(img.crop((0, 0, paste_w, self.img_height)), (0, 0))
-
+            
+            # Normalize to [-1, 1]
             img_tensor = torch.from_numpy(np.array(final_img)).float() / 255.0
             img_tensor = (img_tensor - 0.5) / 0.5
             img_tensor = img_tensor.unsqueeze(0)
 
-            # ========== DECODER TARGETS ==========
-            # [BOS, char1+offset, char2+offset, ..., EOS]
+            # =========================================================
+            # 3. TOKENIZATION
+            # =========================================================
+            # Decoder targets: [BOS, c1, c2, ..., EOS]
             dec_ids = []
             for c in text:
                 raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
                 dec_ids.append(raw_id + self.tokenizer.dec_offset)
             dec_ids = [self.tokenizer.dec_bos] + dec_ids + [self.tokenizer.dec_eos]
 
-            # ========== CTC TARGETS ==========
-            # [char1+ctc_offset, char2+ctc_offset, ...] (no BOS/EOS)
+            # CTC targets: [c1, c2, ...]
             ctc_ids = []
             for c in text:
                 raw_id = self.tokenizer.token_to_id.get(c, self.tokenizer.unk_id)
@@ -170,9 +196,10 @@ class HFTransformerDataset(Dataset):
                 "ctc_target_len": len(ctc_ids),
                 "text": text,
             }
-
+            
         except Exception as e:
             print(f"Error loading sample {idx}: {e}")
+            # Return dummy sample on failure to prevent crash
             return {
                 "image": torch.zeros(1, self.img_height, self.img_width),
                 "dec_target": torch.LongTensor([1, 2]),  # BOS, EOS
@@ -514,6 +541,7 @@ def train_command(args):
             img_width=cfg.IMG_W,
             image_col=args.hf_image_col,
             text_col=args.hf_text_col,
+            augment=True,
         )
         print(f"   Train: {len(train_ds)} samples")
 
@@ -526,6 +554,7 @@ def train_command(args):
                 img_width=cfg.IMG_W,
                 image_col=args.hf_image_col,
                 text_col=args.hf_text_col,
+                augment=False,
             )
             print(f"   Val: {len(val_ds)} samples")
     else:
