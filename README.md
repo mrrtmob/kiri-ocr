@@ -122,6 +122,8 @@ If you find this project useful:
 - [Buy Me a Coffee](https://buymeacoffee.com/tmob)
 - [ABA Payway](https://link.payway.com.kh/ABAPAYfd4073965)
 
+[**Join our Discord Community**](https://discord.gg/jnNbhSaYQ9)
+
 ## ⚖️ License
 
 [Apache License 2.0](https://github.com/mrrtmob/kiri-ocr/blob/main/LICENSE)
