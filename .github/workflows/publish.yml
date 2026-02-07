@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Publish to PyPI & Notify Discord
 
 on:
   release:
@@ -33,3 +33,33 @@ jobs:
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         password: ${{ secrets.PYPI_API_TOKEN }}
+
+    # ---------------------------------------------------------
+    # NOTIFY DISCORD
+    # ---------------------------------------------------------
+
+    - name: Notify Discord (Announcements)
+      if: success()
+      uses: tsickert/discord-webhook@v5.3.0
+      with:
+        webhook-url: ${{ secrets.DISCORD_WEBHOOK_ANNOUNCEMENTS }}
+        username: "Blizzer Bot"
+        avatar-url: "https://github.com/blizzertech.png"
+        content: "🚀 **New Release: Kiri OCR v${{ github.event.release.tag_name }}** is now live on PyPI!"
+        embed-title: "📦 Download on PyPI"
+        embed-url: "https://pypi.org/project/kiri-ocr/"
+        embed-description: "${{ github.event.release.body }}"
+        embed-color: 5814783 # A nice Blue/Purple color
+
+    - name: Notify Discord (Kiri OCR Channel)
+      if: success()
+      uses: tsickert/discord-webhook@v5.3.0
+      with:
+        webhook-url: ${{ secrets.DISCORD_WEBHOOK_OCR }}
+        username: "Blizzer Bot"
+        avatar-url: "https://github.com/blizzertech.png"
+        content: "👀 **Dev Update:** A new version of Kiri OCR (v${{ github.event.release.tag_name }}) has just been published."
+        embed-title: "📜 Release Notes"
+        embed-url: "${{ github.event.release.html_url }}"
+        embed-description: "Check the full changelog on GitHub!"
+        embed-color: 3066993 # Green color for 'Success'
