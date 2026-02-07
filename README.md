@@ -122,7 +122,7 @@ If you find this project useful:
 - [Buy Me a Coffee](https://buymeacoffee.com/tmob)
 - [ABA Payway](https://link.payway.com.kh/ABAPAYfd4073965)
 
-[**Join our Discord Community**](https://discord.gg/jnNbhSaYQ9)
+[**Join our Discord Community**]([https://discord.gg/jnNbhSaYQ9)](https://discord.gg/Vcrw274RVC)
 
 ## ⚖️ License
 
