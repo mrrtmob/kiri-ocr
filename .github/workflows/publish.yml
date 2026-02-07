@@ -45,7 +45,7 @@ jobs:
         webhook-url: ${{ secrets.DISCORD_WEBHOOK_ANNOUNCEMENTS }}
         username: "Blizzer Bot"
         avatar-url: "https://github.com/blizzertech.png"
-        content: "🚀 **New Release: Kiri OCR v${{ github.event.release.tag_name }}** is now live on PyPI!"
+        content: "🚀 **New Release: Kiri OCR ${{ github.event.release.tag_name }}** is now live on PyPI!"
         embed-title: "📦 Download on PyPI"
         embed-url: "https://pypi.org/project/kiri-ocr/"
         embed-description: "${{ github.event.release.body }}"
@@ -58,7 +58,7 @@ jobs:
         webhook-url: ${{ secrets.DISCORD_WEBHOOK_OCR }}
         username: "Blizzer Bot"
         avatar-url: "https://github.com/blizzertech.png"
-        content: "👀 **Dev Update:** A new version of Kiri OCR (v${{ github.event.release.tag_name }}) has just been published."
+        content: "👀 **Dev Update:** A new version of Kiri OCR (${{ github.event.release.tag_name }}) has just been published."
         embed-title: "📜 Release Notes"
         embed-url: "${{ github.event.release.html_url }}"
         embed-description: "Check the full changelog on GitHub!"
