@@ -128,13 +128,3 @@ If you find this project useful:
 
 [Apache License 2.0](https://github.com/mrrtmob/kiri-ocr/blob/main/LICENSE)
 
-## 📚 Citation
-
-```bibtex
-@software{kiri_ocr,
-  author = {mrrtmob},
-  title = {Kiri OCR: Lightweight Khmer and English OCR},
-  year = {2026},
-  url = {https://github.com/mrrtmob/kiri-ocr}
-}
-```
