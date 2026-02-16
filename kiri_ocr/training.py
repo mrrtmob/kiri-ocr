@@ -423,6 +423,19 @@ def train_command(args):
         if not hf_ds_train:
              print("❌ No valid datasets loaded")
              return
+    # Auto-split validation set if not provided
+    if hf_ds_train and not hf_ds_val and hasattr(args, 'hf_val_percent') and args.hf_val_percent > 0:
+        print(f"\n📊 No validation set found. Auto-splitting {args.hf_val_percent*100:.0f}% from training data...")
+        
+        split_ds = hf_ds_train.train_test_split(
+            test_size=args.hf_val_percent, 
+            seed=42
+        )
+        hf_ds_train = split_ds["train"]
+        hf_ds_val = split_ds["test"]
+        
+        print(f"   ✓ Train: {len(hf_ds_train)} samples")
+        print(f"   ✓ Val: {len(hf_ds_val)} samples")
 
     if not vocab_path or not os.path.exists(vocab_path):
         generated_vocab_path = os.path.join(args.output_dir, "vocab.json")
