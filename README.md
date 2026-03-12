@@ -8,6 +8,7 @@
 [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/mrrtmob/kiri-ocr)
 
 **Kiri OCR** is a lightweight OCR library for **English and Khmer** documents. It provides document-level text detection, recognition, and rendering capabilities.
+> **សម្រាប់សហគមន៍កម្ពុជា៖** គម្រោង Kiri OCR គឺជាប្រព័ន្ធ AI កូដបើកចំហ (Open Source) សម្រាប់សម្គាល់ និងទាញយកអក្សរខ្មែរ-អង់គ្លេស ពីរូបភាពទៅជាអត្ថបទ។ ឯកសារទិន្នន័យ និងកូដទាំងអស់ត្រូវបានបើកទូលាយសម្រាប់ឱ្យអ្នកអភិវឌ្ឍន៍ខ្មែរអាចយកទៅសិក្សា និងប្រើប្រាស់បានដោយសេរី។
 
 [**🚀 Try the Live Demo**](https://huggingface.co/spaces/mrrtmob/kiri-ocr) | [**📚 Full Documentation**](https://github.com/mrrtmob/kiri-ocr/wiki)
 
